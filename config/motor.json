@@ -1,0 +1,16 @@
+{
+  "axis_enabled": {
+    "X": true,
+    "Y": false
+  },
+  "default_axis": "X",
+  "default_baud": 115200,
+  "default_port": "COM7",
+  "default_speed": 1,
+  "goto_feed": 600.0,
+  "homing_clearance": 3.0,
+  "homing_feed": 400.0,
+  "homing_long_jog": 1000.0,
+  "jog_feed": 500.0,
+  "jog_step": 1.0
+}
