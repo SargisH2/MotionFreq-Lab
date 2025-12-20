@@ -13,12 +13,9 @@ from config.env import env_bool
 from config.motor import MotorConfig, load_motor_config, save_motor_config
 from ui.motor_shared import select_port_value
 
-try:
-    from hardware.motor import MotorController, MotorError, list_serial_ports as motor_list_serial_ports
-except Exception:  # pragma: no cover - fallback when hardware package unavailable
-    MotorController = None  # type: ignore[assignment]
-    MotorError = RuntimeError  # type: ignore[assignment]
-    motor_list_serial_ports = None  # type: ignore[assignment]
+from hardware.motor_controller import MotorController
+from hardware.motor_driver import list_serial_ports as motor_list_serial_ports
+from hardware.motor_types import MotorError
 
 ALARM_PREFIX = "ALARM"
 OK_PREFIX = "ok"
@@ -83,6 +80,7 @@ class GRBLInterface:
         self.settings = {}
 
         self.home_x_mpos = None
+        self.home_y_mpos = None
         # Per-axis last captured machine positions at edges
         self.last_home_mpos = {}
         self.last_finish_mpos = {}
@@ -95,6 +93,10 @@ class GRBLInterface:
         self.last_span = {}
 
         cfg = self._motor_config
+
+        # Steps/mm fallback for measurement flows (UI distances are entered in mm)
+        self.default_steps_per_mm = 1.0
+        self._steps_warned: set[str] = set()
 
         # === Top connection row ===
         top = ttk.Frame(master)
@@ -162,10 +164,11 @@ class GRBLInterface:
         home = ttk.LabelFrame(mid, text="Custom Homing (hard-limit based)")
         home.grid(row=0, column=2, sticky="nsew", padx=(0,8))
         ttk.Button(home, text="Home X", command=self.start_home_x).grid(row=0, column=0, sticky="ew", padx=4, pady=2)
-        ttk.Button(home, text="Home X+Y", command=self.start_home_xy).grid(row=1, column=0, sticky="ew", padx=4, pady=2)
-        ttk.Button(home, text="Stop", command=self.request_stop).grid(row=2, column=0, sticky="ew", padx=4, pady=2)
-        ttk.Button(home, text="Go X Mid", command=lambda: self.go_mid('X')).grid(row=3, column=0, sticky="ew", padx=4, pady=2)
-        ttk.Button(home, text="Go Y Mid", command=lambda: self.go_mid('Y')).grid(row=4, column=0, sticky="ew", padx=4, pady=2)
+        ttk.Button(home, text="Home Y", command=self.start_home_y).grid(row=1, column=0, sticky="ew", padx=4, pady=2)
+        ttk.Button(home, text="Home X+Y", command=self.start_home_xy).grid(row=2, column=0, sticky="ew", padx=4, pady=2)
+        ttk.Button(home, text="Stop", command=self.request_stop).grid(row=3, column=0, sticky="ew", padx=4, pady=2)
+        ttk.Button(home, text="Go X Mid", command=lambda: self.go_mid('X')).grid(row=4, column=0, sticky="ew", padx=4, pady=2)
+        ttk.Button(home, text="Go Y Mid", command=lambda: self.go_mid('Y')).grid(row=5, column=0, sticky="ew", padx=4, pady=2)
 
         # Manual Jog panel
         jog = ttk.LabelFrame(mid, text="Manual Jog")
@@ -187,6 +190,9 @@ class GRBLInterface:
         row_btns += 1
         ttk.Button(jog, text="Set X Home (MPos)", command=self.capture_x_home).grid(row=row_btns, column=0, sticky="ew", padx=4, pady=2)
         ttk.Button(jog, text="Go X Home", command=self.go_x_home).grid(row=row_btns, column=1, sticky="ew", padx=4, pady=2)
+        row_btns += 1
+        ttk.Button(jog, text="Set Y Home (MPos)", command=self.capture_y_home).grid(row=row_btns, column=0, sticky="ew", padx=4, pady=2)
+        ttk.Button(jog, text="Go Y Home", command=self.go_y_home).grid(row=row_btns, column=1, sticky="ew", padx=4, pady=2)
 
         # Position display + Go To controls
         posctl = ttk.LabelFrame(mid, text="Position / Go To")
@@ -200,6 +206,8 @@ class GRBLInterface:
         self.mpos_y = tk.StringVar(value="---")
         self.wpos_x = tk.StringVar(value="---")
         self.wpos_y = tk.StringVar(value="---")
+        self.span_x = tk.StringVar(value="---")
+        self.span_y = tk.StringVar(value="---")
 
         ttk.Label(posctl, text="State:").grid(row=0, column=0, sticky="w")
         ttk.Label(posctl, textvariable=self.state_var).grid(row=0, column=1, sticky="w")
@@ -233,6 +241,12 @@ class GRBLInterface:
         self.goto_feed.grid(row=2, column=10, sticky="w", padx=(4,8), pady=(4,0))
 
         ttk.Button(posctl, text="Move", command=self.move_to_coords).grid(row=2, column=11, sticky="ew", padx=(8,0), pady=(4,0))
+
+        ttk.Label(posctl, text="Length (mm):").grid(row=3, column=0, sticky="w", pady=(2,0))
+        ttk.Label(posctl, text="X").grid(row=3, column=1, sticky="e", pady=(2,0))
+        ttk.Label(posctl, textvariable=self.span_x).grid(row=3, column=2, sticky="w", pady=(2,0))
+        ttk.Label(posctl, text="Y").grid(row=3, column=3, sticky="e", pady=(2,0))
+        ttk.Label(posctl, textvariable=self.span_y).grid(row=3, column=4, sticky="w", pady=(2,0))
 
 
         # Speed / Acceleration config
@@ -287,7 +301,7 @@ class GRBLInterface:
             try:
                 ports = motor_list_serial_ports()
             except Exception:
-                LOGGER.exception("Failed to enumerate motor ports via hardware.motor")
+                LOGGER.exception("Failed to enumerate motor ports via motor_driver")
                 ports = []
             if getattr(backend, "is_simulation", False) and "Simulated Motor" not in ports:
                 ports.insert(0, "Simulated Motor")
@@ -531,10 +545,19 @@ class GRBLInterface:
         else:
             self._motor_config = cfg
 
-    def _motor_backend(self) -> Optional["MotorController"]:
+    def _motor_backend(self) -> Optional[MotorController]:
         if not self._use_motor_backend:
             return None
         return self._motor
+
+    def _update_axis_length_display(self, axis: str, span: float) -> None:
+        """Update the UI labels that show the homed travel length per axis."""
+
+        label = self.span_x if axis.upper() == "X" else self.span_y
+        try:
+            label.set(f"{span:.3f}")
+        except Exception:
+            pass
 
     def _update_port_defaults(self, port: str, baud: int) -> None:
         cfg = load_motor_config()
@@ -552,6 +575,55 @@ class GRBLInterface:
                 LOGGER.exception("Failed to save motor config", exc_info=True)
             else:
                 self._motor_config = cfg
+
+    def _steps_per_mm(self, axis: str) -> float:
+        key = "$100" if axis.upper() == "X" else "$101"
+        try:
+            raw = float(self.settings.get(key, self.default_steps_per_mm))
+        except Exception:
+            raw = self.default_steps_per_mm
+        if raw <= 0:
+            raw = self.default_steps_per_mm
+        if key not in self._steps_warned and key not in self.settings:
+            self._steps_warned.add(key)
+            self.log(f"ℹ Using default steps/mm ({raw:g}) for {axis}; read $$ to load $100/$101.")
+        return raw
+
+    def _ui_distance_to_mm(self, _axis: str, distance_mm: float) -> float:
+        """UI jog/move distances are already expressed in mm."""
+
+        try:
+            return float(distance_mm)
+        except Exception:
+            return 0.0
+
+    def _ui_feed_to_mm(self, _axis: str, feed_mm_per_min: float) -> float:
+        """UI feeds are already expressed in mm/min."""
+
+        try:
+            return float(feed_mm_per_min)
+        except Exception:
+            return 0.0
+
+    def _wait_for_motion_settle(self, axis: str, distance: float, feed: float) -> None:
+        """Poll status to confirm GRBL finished the commanded jog."""
+
+        est = abs(distance) / max(feed, 1e-6) * 60.0
+        timeout = min(3.0, est + 0.6)
+        start = time.time()
+        while time.time() - start < timeout and not self.stop_event.is_set():
+            try:
+                self.query_status()
+            except Exception:
+                pass
+            time.sleep(0.1)
+            with self.status_lock:
+                status = self.last_status
+            if status.startswith("<Idle"):
+                return
+            if status.startswith("ALARM"):
+                self.alarm_event.set()
+                return
 
     # -------------------- Safe send wrappers --------------------
     def safe_send_raw(self, data: bytes) -> bool:
@@ -642,103 +714,118 @@ class GRBLInterface:
                 pass
         return m
     
-    def capture_x_home(self):
+    def _capture_home(self, axis: str) -> None:
+        ax = axis.upper()
         if not self.is_connected():
             self.log("❌ Not connected")
             return
         m = self.get_mpos()
-        if not m:
+        if not m or ax not in m:
             self.log("⚠ Could not read MPos to capture home.")
             return
-        self.home_x_mpos = m["X"]
-        self.last_home_mpos["X"] = self.home_x_mpos
-        self.log(f"🏠 Captured X Home (MPos): {self.home_x_mpos:.3f}")
-    
-    def go_x_home(self):
+        pos = m[ax]
+        if ax == "X":
+            self.home_x_mpos = pos
+        elif ax == "Y":
+            self.home_y_mpos = pos
+        self.last_home_mpos[ax] = pos
+        self.log(f"🏠 Captured {ax} Home (MPos): {pos:.3f}")
+
+    def capture_x_home(self):
+        self._capture_home("X")
+
+    def capture_y_home(self):
+        self._capture_home("Y")
+
+    def _get_home_target(self, axis: str) -> float | None:
+        ax = axis.upper()
+        if ax == "X":
+            return self.home_x_mpos
+        if ax == "Y":
+            return self.home_y_mpos
+        return None
+
+    def _set_home_target(self, axis: str, value: float) -> None:
+        ax = axis.upper()
+        if ax == "X":
+            self.home_x_mpos = value
+        elif ax == "Y":
+            self.home_y_mpos = value
+        self.last_home_mpos[ax] = value
+
+    def _go_home(self, axis: str):
+        ax = axis.upper()
         if not self.is_connected():
             self.log("❌ Not connected")
             return
         backend = self._motor_backend()
         if backend is not None:
             try:
-                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "400")
+                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
             except Exception:
-                base_feed = 400.0
-            gentle = min(200.0, max(60.0, base_feed))
+                base_feed = 1600.0
+            gentle = min(1600.0, max(60.0, base_feed))
             try:
-                current = backend.get_position("X")
+                current = backend.get_position(ax)
             except Exception as exc:
                 self.log(f"⚠ Could not read current position: {exc}")
                 return
             delta = -current
             if abs(delta) < 1e-3:
-                self.log("✅ Already at X home (0.000).")
+                self.log(f"✅ Already at {ax} home (0.000).")
                 return
             try:
-                backend.jog_increment("X", delta, gentle)
-                self.home_x_mpos = 0.0
-                self.last_home_mpos["X"] = 0.0
-                self.log("📍 Jogging to X Home (0.000)")
+                backend.jog_increment(ax, delta, gentle)
+                self._set_home_target(ax, 0.0)
+                self.log(f"📍 Jogging to {ax} Home (0.000)")
             except Exception as exc:
-                self.log(f"❌ Failed to move to X home: {exc}")
+                self.log(f"❌ Failed to move to {ax} home: {exc}")
             return
-        # If we have WCS zero set (after homing), move to X0 as home
-        if self.home_x_mpos is None:
+        home_target = self._get_home_target(ax)
+        if home_target is None:
             try:
-                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "400")
+                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
             except Exception:
-                base_feed = 400.0
-            gentle = min(200.0, max(60.0, base_feed))
-            # Use absolute move to work zero
+                base_feed = 1600.0
+            gentle = min(1600.0, max(60.0, base_feed))
             if not self.safe_send("G90"):
                 return
             self.wait_for_ok_or_idle(0.2)
-            if not self.safe_send(f"G1 X0 F{gentle:.1f}"):
+            if not self.safe_send(f"G1 {ax}0 F{gentle:.1f}"):
                 return
-            # brief settle, then log
             time.sleep(0.3)
-            self.log("📍 Moved to X Home (WCS X0)")
+            self.log(f"📍 Moved to {ax} Home (WCS {ax}0)")
             return
-    
-        # read current machine position and compute delta
         m = self.get_mpos()
-        if not m:
+        if not m or ax not in m:
             self.log("⚠ Could not read current MPos to go home.")
             return
-        cur = m["X"]
-        delta = self.home_x_mpos - cur
+        cur = m[ax]
+        delta = home_target - cur
         if abs(delta) < 1e-3:
-            self.log("✅ Already at X Home.")
+            self.log(f"✅ Already at {ax} Home.")
             return
-    
-        # pick a feed (use jog feed if set, else homing feed, else 400)
         try:
             feed = float(self.jog_feed.get() or self.feed_entry.get() or "400")
         except Exception:
-            feed = 400.0
-        # Use a gentle feed for approach
-        feed = min(200.0, max(60.0, feed))
-    
-        # optional clamp if span is known and large enough
-        lo = self.last_finish_mpos.get('X')
-        hi = self.last_home_mpos.get('X')
+            feed = 1600.0
+        feed = min(1600.0, max(60.0, feed))
+        lo = self.last_finish_mpos.get(ax)
+        hi = self.last_home_mpos.get(ax)
         if lo is not None and hi is not None:
             span = abs(hi - lo)
             if span >= 0.5:
                 lo_, hi_ = (lo, hi) if lo <= hi else (hi, lo)
                 margin = min(0.2, 0.1 * span)
-                target = max(min(self.home_x_mpos, hi_ - margin), lo_ + margin)
-                if abs(target - self.home_x_mpos) > 1e-6:
-                    self.log(f"ℹ Clamped X Home target within span [{lo_:.3f},{hi_:.3f}] → {target:.3f}")
+                target = max(min(home_target, hi_ - margin), lo_ + margin)
+                if abs(target - home_target) > 1e-6:
+                    self.log(f"ℹ Clamped {ax} Home target within span [{lo_:.3f},{hi_:.3f}] → {target:.3f}")
                 delta = target - cur
-
-        # incremental, gentle chunked jog to target
         self.stop_event.clear(); self.alarm_event.clear()
         if not self.safe_send("G91"):
             return
         self.wait_for_ok_or_idle(0.2)
         remaining = delta
-        # Use small, decelerating step sizes to avoid overshoot near switch
         def pick_step(rem):
             mag = abs(rem)
             if mag > 2.0:
@@ -754,9 +841,8 @@ class GRBLInterface:
         moved = 0.0
         while abs(remaining) > 1e-3 and not self.alarm_event.is_set():
             d = step if abs(remaining) > abs(step) else remaining
-            if not self.safe_send(f"$J=G91 X{d:.3f} F{feed:.1f}"):
+            if not self.safe_send(f"$J=G91 {ax}{d:.3f} F{feed:.1f}"):
                 break
-            # wait for approximate move duration
             try:
                 est = abs(d) / max(feed, 1e-3) * 60.0
                 time.sleep(max(0.15, min(1.5, est)))
@@ -767,11 +853,9 @@ class GRBLInterface:
             step = pick_step(remaining)
             if self.stop_event.is_set():
                 break
-        # allow motion to settle and verify
         self.wait_for_ok_or_idle(2.0)
         if self.alarm_event.is_set():
-            # Hit the switch; recover, pull off slightly, and set/capture home at safe offset
-            self.log("⚠ Alarm while approaching X Home; performing pull-off and capture.")
+            self.log(f"⚠ Alarm while approaching {ax} Home; performing pull-off and capture.")
             try:
                 self._recover_after_alarm("home approach")
             except Exception:
@@ -781,17 +865,22 @@ class GRBLInterface:
                     return
             pull = 0.3
             self.safe_send("G91"); self.wait_for_ok_or_idle(0.2)
-            self.safe_send(f"$J=G91 X{-pull:.3f} F{feed:.1f}")
+            self.safe_send(f"$J=G91 {ax}{-pull:.3f} F{feed:.1f}")
             time.sleep(max(0.3, min(1.0, pull / max(feed, 1e-3) * 60.0)))
             m2 = self.get_mpos() or {}
-            if 'X' in m2:
-                self.home_x_mpos = m2['X']
-                self.last_home_mpos['X'] = self.home_x_mpos
-                self.log(f"📌 Captured X Home after pull-off: {self.home_x_mpos:.3f}")
+            if ax in m2:
+                self._set_home_target(ax, m2[ax])
+                self.log(f"📌 Captured {ax} Home after pull-off: {m2[ax]:.3f}")
             return
         m2 = self.get_mpos() or {}
-        at = m2.get('X', self.home_x_mpos)
-        self.log(f"📍 Moved to X Home at MPos {at:.3f} (target {self.home_x_mpos:.3f})")
+        at = m2.get(ax, home_target)
+        self.log(f"📍 Moved to {ax} Home at MPos {at:.3f} (target {home_target:.3f})")
+
+    def go_x_home(self):
+        self._go_home("X")
+
+    def go_y_home(self):
+        self._go_home("Y")
 
     def soft_reset(self):
         # Cancel jog, send Ctrl-X, drain via reader, wait for banner
@@ -962,68 +1051,51 @@ class GRBLInterface:
                 return None
             return float(txt)
         try:
-            x = read_val(getattr(self, 'goto_x', None))
-            y = read_val(getattr(self, 'goto_y', None))
+            x_mm = read_val(getattr(self, 'goto_x', None))
+            y_mm = read_val(getattr(self, 'goto_y', None))
             feed_txt = (self.goto_feed.get().strip() if hasattr(self, 'goto_feed') else '')
             if feed_txt == "":
                 # Fall back to jog feed or homing feed
                 try:
-                    feed = float(self.jog_feed.get() or self.feed_entry.get() or "400")
+                    feed_mm = float(self.jog_feed.get() or self.feed_entry.get() or "400")
                 except Exception:
-                    feed = 400.0
+                    feed_mm = 400.0
             else:
-                feed = float(feed_txt)
+                feed_mm = float(feed_txt)
         except ValueError:
             messagebox.showerror("Invalid input", "Please enter numeric values for X/Y and Feed.")
             return
 
+        mode = (self.move_mode.get() if hasattr(self, 'move_mode') else 'abs')
+
         # No coordinates provided
-        if x is None and y is None:
+        if x_mm is None and y_mm is None:
             self.log("ℹ No coordinates provided.")
             return
 
         backend = self._motor_backend()
         if backend is not None:
-            moves = []
+            feed_value = max(1.0, feed_mm)
             try:
-                feed = float(feed_txt or self.jog_feed.get() or self.feed_entry.get() or "400")
-            except Exception:
-                feed = 400.0
-            feed = max(1.0, feed)
-            try:
-                if x is not None:
+                if x_mm is not None:
                     if mode == 'abs':
-                        current = backend.get_position("X")
-                        delta = x - current
+                        backend.move_to_coordinate("X", x_mm, feed=feed_value)
+                        self.log(f"→ Move: X -> {x_mm:.3f} mm @ F{feed_value:.1f}")
                     else:
-                        delta = x
-                    moves.append(("X", delta))
-                if y is not None:
+                        backend.move_by("X", x_mm, feed=feed_value)
+                        self.log(f"→ Move: X Δ{x_mm:.3f} mm @ F{feed_value:.1f}")
+                if y_mm is not None:
                     if mode == 'abs':
-                        current = backend.get_position("Y")
-                        delta = y - current
+                        backend.move_to_coordinate("Y", y_mm, feed=feed_value)
+                        self.log(f"→ Move: Y -> {y_mm:.3f} mm @ F{feed_value:.1f}")
                     else:
-                        delta = y
-                    moves.append(("Y", delta))
+                        backend.move_by("Y", y_mm, feed=feed_value)
+                        self.log(f"→ Move: Y Δ{y_mm:.3f} mm @ F{feed_value:.1f}")
             except Exception as exc:
-                self.log(f"❌ Failed to compute move delta: {exc}")
-                return
-            if not moves:
-                self.log("ℹ No movement required.")
-                return
-            for axis, delta in moves:
-                if abs(delta) < 1e-4:
-                    continue
-                try:
-                    backend.jog_increment(axis, delta, feed)
-                    self.log(f"→ Move: {axis} Δ{delta:.3f} @ F{feed:.1f}")
-                except Exception as exc:
-                    self.log(f"❌ Failed to jog {axis}: {exc}")
-                    break
+                self.log(f"❌ Motor move failed: {exc}")
             return
 
         # Build move in requested mode
-        mode = (self.move_mode.get() if hasattr(self, 'move_mode') else 'abs')
         if mode == 'abs':
             if not self.safe_send("G90"):
                 return
@@ -1033,11 +1105,11 @@ class GRBLInterface:
         self.wait_for_ok_or_idle(0.3)
 
         parts = []
-        if x is not None:
-            parts.append(f"X{x:.3f}")
-        if y is not None:
-            parts.append(f"Y{y:.3f}")
-        cmd = "G1 " + " ".join(parts) + f" F{float(feed):.1f}"
+        if x_mm is not None:
+            parts.append(f"X{x_mm:.3f}")
+        if y_mm is not None:
+            parts.append(f"Y{y_mm:.3f}")
+        cmd = "G1 " + " ".join(parts) + f" F{float(feed_mm):.1f}"
         if self.safe_send(cmd):
             self.log(f"→ Move: {cmd}")
         else:
@@ -1088,7 +1160,13 @@ class GRBLInterface:
                 pass
             return
         cmd = f"$J=G91 {axis}{distance:.3f} F{feed:.1f}"
-        self.safe_send(cmd)
+        if self.safe_send(cmd):
+            # Wait for controller acknowledgement/idle before issuing another step
+            try:
+                est = abs(distance) / max(feed, 1e-6) * 60.0
+            except Exception:
+                est = 0.2
+            self.wait_for_ok_or_idle(timeout=max(0.2, min(3.0, est + 0.2)))
         # Accumulate commanded distance if measuring span for this axis
         try:
             if self.measure_active and axis.upper() == (self.measure_axis or ""):
@@ -1098,15 +1176,23 @@ class GRBLInterface:
 
     def manual_jog(self, axis: str, dir_sign: int):
         try:
-            step = float(self.jog_step.get())
-            feed = float(self.jog_feed.get())
-            step = abs(step) * (1 if dir_sign > 0 else -1)
+            step_mm = float(self.jog_step.get())
+            feed_mm = float(self.jog_feed.get())
+            step_mm = abs(step_mm) * (1 if dir_sign > 0 else -1)
             self.stop_event.clear()
-            self.jog_inc(axis.upper(), step, feed)
+            self.jog_inc(axis.upper(), step_mm, feed_mm)
         except ValueError:
             messagebox.showerror("Invalid value", "Please enter numeric Step and Feed values.")
 
-    def move_until_alarm(self, axis: str, direction: int, long_mm: float, feed: float, label: str):
+    def move_until_alarm(
+        self,
+        axis: str,
+        direction: int,
+        long_mm: float,
+        feed: float,
+        label: str,
+        step_mm: float | None = None,
+    ) -> None:
         """
         Repeatedly jog in small chunks until ALARM is raised.
         - direction: +1 or -1
@@ -1114,10 +1200,11 @@ class GRBLInterface:
         """
         axis = axis.upper()
         dir_sign = 1 if direction > 0 else -1
-        feed = float(feed or 400.0)
+        feed = float(feed or 1600.0)
     
         # choose a chunk size (mm) that’s gentle but moves forward
-        chunk = max(0.5, min(10.0, abs(long_mm)))  # 0.5..10 mm per step
+        raw_chunk = step_mm if step_mm is not None else long_mm
+        chunk = max(0.5, min(10.0, abs(raw_chunk)))  # 0.5..10 mm per step
         max_runtime = 60.0                          # seconds hard timeout
         max_steps = int(max(200, min(5000, (abs(long_mm) * 10) / chunk)))  # safety cap
     
@@ -1136,6 +1223,9 @@ class GRBLInterface:
                 # send one small incremental jog
                 self.jog_inc(axis, dir_sign * chunk, feed)
                 steps += 1
+                # wait for planner confirmation/idle to avoid stacking tiny moves
+                self.wait_for_ok_or_idle(timeout=max(0.2, min(1.5, abs(chunk) / max(feed, 1e-6) * 60.0)))
+                self._wait_for_motion_settle(axis, chunk, feed)
 
                 # Wait approximately for move duration to avoid stacking jogs
                 est_s = max(0.15, min(2.0, (abs(chunk) / max(feed, 1e-6)) * 60.0))
@@ -1153,7 +1243,7 @@ class GRBLInterface:
                         raise RuntimeError("Controller reset/locked; unlock with $X before jogging.")
                     if self.alarm_event.is_set() or self.stop_event.is_set():
                         break
-                    time.sleep(0.02)
+                    # time.sleep(0.02)
                     waited += 0.02
     
                 # safety guards
@@ -1306,6 +1396,9 @@ class GRBLInterface:
     def start_home_x(self):
         threading.Thread(target=self._home_sequence, args=(True, False), daemon=True).start()
 
+    def start_home_y(self):
+        threading.Thread(target=self._home_sequence, args=(False, True), daemon=True).start()
+
     def start_home_xy(self):
         threading.Thread(target=self._home_sequence, args=(True, True), daemon=True).start()
 
@@ -1337,39 +1430,12 @@ class GRBLInterface:
         self.wait_for_ok_or_idle(0.5)
 
     def _home_sequence(self, do_x: bool, do_y: bool):
-        backend = self._motor_backend()
-        if backend is not None:
-            if not self.is_connected():
-                self.log("❌ Not connected")
-                return
-            axes: list[str] = []
-            if do_x and self.x_en.get():
-                axes.append("X")
-            if do_y and self.y_en.get():
-                axes.append("Y")
-            if not axes:
-                self.log("Nothing to home (no axes selected)")
-                return
-            self.set_state("Homing...")
-            ok = True
-            for axis in axes:
-                try:
-                    backend.home(axis)
-                    self.last_home_mpos[axis] = 0.0
-                    self.home_x_mpos = 0.0 if axis == "X" else self.home_x_mpos
-                    self.log(f"✅ Homed axis {axis} via shared controller")
-                except Exception as exc:
-                    ok = False
-                    self.log(f"❌ Homing {axis} failed: {exc}")
-                    break
-            self.set_state("Idle" if ok else "Error")
-            return
         if not self.is_connected():
             self.log("❌ Not connected")
             return
         homed_ok = True
         try:
-            feed = float(self.feed_entry.get() or "400")
+            feed = float(self.feed_entry.get() or "1600")
             clear_mm = float(self.clear_entry.get() or "3")
             long_mm = float(self.long_entry.get() or "1000")
 
@@ -1391,6 +1457,14 @@ class GRBLInterface:
 
             if do_x and self.x_en.get():
                 homed_ok &= self._home_one_axis_release("X", long_mm, feed, clear_mm)
+                if homed_ok and do_y and self.y_en.get():
+                    # Return X to its captured home before starting Y
+                    try:
+                        self.log("↩ Moving X back to home before starting Y homing")
+                        self.go_x_home()
+                    except Exception as exc:
+                        self.log(f"⚠ Failed to return X to home before Y: {exc}")
+                        homed_ok = False
 
             if do_y and self.y_en.get():
                 homed_ok &= self._home_one_axis_release("Y", long_mm, feed, clear_mm)
@@ -1425,10 +1499,10 @@ class GRBLInterface:
         # Prefer saved midpoint in WCS if available
         if ax in getattr(self, 'last_mid_wcs', {}):
             try:
-                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "400")
+                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
             except Exception:
-                base_feed = 400.0
-            gentle = min(200.0, max(60.0, base_feed))
+                base_feed = 1600.0
+            gentle = min(1600.0, max(60.0, base_feed))
             target = self.last_mid_wcs[ax]
             if not self.safe_send("G90"):
                 return
@@ -1465,10 +1539,10 @@ class GRBLInterface:
             return
         try:
             feed_in = self.jog_feed.get() if hasattr(self, 'jog_feed') else ''
-            base_feed = float(feed_in or self.feed_entry.get() or "400")
+            base_feed = float(feed_in or self.feed_entry.get() or "1600")
         except Exception:
-            base_feed = 400.0
-        gentle = min(200.0, max(60.0, base_feed))
+            base_feed = 1600.0
+        gentle = min(1600.0, max(60.0, base_feed))
         # Ensure fresh start
         self.stop_event.clear(); self.alarm_event.clear()
         if not self.safe_send("G91"):
@@ -1515,7 +1589,7 @@ class GRBLInterface:
     def _home_one_axis_release(self, axis: str, long_mm: float, feed: float, clear_mm: float) -> bool:
         ax = axis.upper()
         self.log(f"=== Homing {ax} (release-based) ===")
-        gentle = min(200.0, max(100.0, float(feed or 400)))
+        gentle = min(1600.0, max(100.0, float(feed or 1600)))
         pull = max(0.2, min(2.0, abs(clear_mm)))
 
         plus_release = None
@@ -1532,13 +1606,14 @@ class GRBLInterface:
             if m and ax in m:
                 plus_release = m[ax]
                 self.log(f"📌 {ax}+ release MPos: {plus_release:.3f}")
+                self.last_finish_mpos[ax] = plus_release
             # Start span measurement from +release to -release
             self.measure_active = True
             self.measure_axis = ax
             self.measure_accum = 0.0
 
             # 2) Seek -limit until ALARM using small steps for accuracy
-            self.move_until_alarm(ax, -1, 0.5, gentle, label="-limit")
+            self.move_until_alarm(ax, -1, long_mm, gentle, label="-limit", step_mm=3.0)
             # Recover and jog off until switch releases; capture minus_release
             self._recover_after_alarm("-limit")
             if not self.clear_limit_with_retries(ax, away_dir=+1, feed_clear=gentle, step_mm=0.25, max_attempts=40):
@@ -1555,47 +1630,29 @@ class GRBLInterface:
             self.measure_active = False
             span = abs(self.measure_accum)
             self.last_span[ax] = span
+            self._update_axis_length_display(ax, span)
             self.log(f"📏 {ax} span by command distance = {span:.3f} mm")
 
-            # 3) Set zero at -release (work zero) and move to midpoint (+span/2)
+            # 3) Set zero at -release (work zero) and stay there
             if not self.safe_send(f"G92 {ax}0"):
                 return False
             self.wait_for_ok_or_idle(0.5)
-            self.log(f"🎯 Set {ax}0 at -release")
-            center_offset = span / 2.0
-            if abs(center_offset) > 1e-3:
-                self.safe_send("G91"); self.wait_for_ok_or_idle(0.2)
-                remaining = center_offset
-                def pick_step(rem):
-                    mag = abs(rem)
-                    if mag > 2.0:
-                        s = 1.0
-                    elif mag > 1.0:
-                        s = 0.5
-                    elif mag > 0.5:
-                        s = 0.3
-                    else:
-                        s = 0.2
-                    return s if rem >= 0 else -s
-                step = pick_step(remaining)
-                moved = 0.0
-                while abs(remaining) > 1e-3 and not self.alarm_event.is_set():
-                    d = step if abs(remaining) > abs(step) else remaining
-                    if not self.safe_send(f"$J=G91 {ax}{d:.3f} F{gentle:.1f}"):
-                        break
-                    try:
-                        est = abs(d) / max(gentle, 1e-3) * 60.0
-                        time.sleep(max(0.15, min(1.5, est)))
-                    except Exception:
-                        time.sleep(0.2)
-                    moved += d
-                    remaining = center_offset - moved
-                    step = pick_step(remaining)
-                self.wait_for_ok_or_idle(2.0)
-                self.log(f"📍 Moved to {ax} midpoint (offset {center_offset:.3f} from -release)")
-            # Save fixed midpoint position in WCS for this axis
+            # Reset cached home positions to WCS zero
+            if ax == 'X':
+                self.home_x_mpos = 0.0
+            elif ax == 'Y':
+                self.home_y_mpos = 0.0
+            self.last_home_mpos[ax] = 0.0
+            backend = self._motor_backend()
+            if backend is not None:
+                try:
+                    backend.set_position(ax, 0.0)
+                except Exception:
+                    self.log(f"⚠ Failed to sync {ax} position to 0 in backend")
+            self.log(f"🎯 Set {ax}0 at -release; homing complete for {ax}")
+            # Save midpoint for future 'Go mid' but keep position at home
             try:
-                self.last_mid_wcs[ax] = center_offset
+                self.last_mid_wcs[ax] = span / 2.0
             except Exception:
                 pass
             return True

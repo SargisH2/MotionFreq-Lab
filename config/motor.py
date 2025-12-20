@@ -20,12 +20,12 @@ class MotorConfig:
     default_speed: int = 100
     default_port: str = ""
     default_baud: int = 115200
-    homing_feed: float = 400.0
+    homing_feed: float = 1600.0
     homing_clearance: float = 3.0
     homing_long_jog: float = 1000.0
     jog_step: float = 1.0
-    jog_feed: float = 600.0
-    goto_feed: float = 600.0
+    jog_feed: float = 1600.0
+    goto_feed: float = 1600.0
     axis_enabled: Dict[str, bool] = field(default_factory=lambda: {"X": True, "Y": False})
 
     @classmethod
@@ -37,12 +37,12 @@ class MotorConfig:
             default_speed=int(data.get("default_speed", 100)),
             default_port=str(data.get("default_port", "")),
             default_baud=int(data.get("default_baud", 115200)),
-            homing_feed=float(data.get("homing_feed", 400.0)),
+            homing_feed=float(data.get("homing_feed", 1600.0)),
             homing_clearance=float(data.get("homing_clearance", 3.0)),
             homing_long_jog=float(data.get("homing_long_jog", 1000.0)),
             jog_step=float(data.get("jog_step", 1.0)),
-            jog_feed=float(data.get("jog_feed", 600.0)),
-            goto_feed=float(data.get("goto_feed", 600.0)),
+            jog_feed=float(data.get("jog_feed", 1600.0)),
+            goto_feed=float(data.get("goto_feed", 1600.0)),
             axis_enabled=axis_enabled,
         )
 

@@ -27,7 +27,9 @@ from hardware.daq import (
     FrequencyDAQ,
     MIN_SAMPLE_INTERVAL,
 )
-from hardware.motor import AXES, MotorController, MotorError, MotorState, list_serial_ports
+from hardware.motor_controller import MotorController
+from hardware.motor_driver import list_serial_ports
+from hardware.motor_types import AXES, MotorError, MotorState
 from ui.motor_shared import prepare_port_list, select_port_value
 from models.data_buffers import MeasurementBuffer, MeasurementRow, ModeLiteral, PlotIdLiteral
 
@@ -52,11 +54,13 @@ MODE_LABELS: Dict[ModeLiteral, str] = {
 
 MODE_XLABELS: Dict[ModeLiteral, str] = {
     "no_motor_time": "Time (s)",
-    "pos_from_zero": "Coordinate (mm)",
-    "neg_from_zero": "Coordinate (mm)",
+    "pos_from_zero": "Coordinate (steps)",
+    "neg_from_zero": "Coordinate (steps)",
 }
 
 SIMULATED_PORT_NAME = "Simulated Motor"
+# Default steps/mm fallback if $100/$101 are not read yet (GRBL default for our setup)
+DEFAULT_STEPS_PER_MM = 1600.0
 
 
 @dataclass
@@ -196,8 +200,34 @@ class MeasurementsTab(ttk.Frame):
         self._daq_interval_sec = 0.0
         self._daq_auto_trigger = True
         self._active_daq_plot: Optional[PlotIdLiteral] = None
+        self._steps_warned: set[str] = set()
 
         self._build_ui()
+
+    # ------------------------------------------------------------------ #
+    # Unit helpers
+    def _steps_per_mm(self, axis: str) -> float:
+        """Return configured steps/mm for an axis, falling back to a sensible default."""
+
+        key = "$100" if axis.upper() == "X" else "$101"
+        try:
+            raw = float(self.settings.get(key, DEFAULT_STEPS_PER_MM))
+        except Exception:
+            raw = DEFAULT_STEPS_PER_MM
+        if raw <= 0:
+            raw = DEFAULT_STEPS_PER_MM
+        if key not in self._steps_warned and key not in self.settings:
+            self._steps_warned.add(key)
+            self._logger.info("Using default steps/mm (%g) for %s; read $$ to load %s", raw, axis.upper(), key)
+        return raw
+
+    def _mm_to_steps(self, value_mm: float, axis: str) -> float:
+        """Convert a distance in mm to motor steps using the configured steps/mm."""
+
+        try:
+            return float(value_mm) * self._steps_per_mm(axis)
+        except Exception:
+            return 0.0
         self._poll_status()
         self.after(200, self.refresh_ports)
 
@@ -908,15 +938,20 @@ class MeasurementsTab(ttk.Frame):
                     timestamp = datetime.now()
                     if mode != "no_motor_time" and self._motor.is_connected():
                         try:
-                            coordinate = self._motor.get_position(axis)
+                            coordinate_mm = self._motor.get_position(axis)
                         except MotorError:
-                            coordinate = 0.0
+                            coordinate_mm = 0.0
                     else:
-                        coordinate = 0.0
+                        coordinate_mm = 0.0
 
                     elapsed = time.perf_counter() - runtime.start_monotonic
-                    x_value = elapsed if mode == "no_motor_time" else coordinate
-                    self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate, x_value, elapsed, timestamp)
+                    if mode == "no_motor_time":
+                        x_value = elapsed
+                        coordinate_steps = 0.0
+                    else:
+                        coordinate_steps = self._mm_to_steps(coordinate_mm, axis)
+                        x_value = coordinate_steps
+                    self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate_steps, x_value, elapsed, timestamp)
                     if direction != 0 and not stop_event.is_set():
                         try:
                             if not self._wait_for_motor_ready(runtime, stop_event):

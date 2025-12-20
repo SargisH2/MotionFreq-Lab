@@ -34,10 +34,7 @@ except Exception as exc:  # pragma: no cover
     logging.getLogger(__name__).exception("Failed to import MeasurementsTab", exc_info=exc)
     raise
 
-try:
-    from hardware.motor import MotorController
-except Exception:  # pragma: no cover - UI can still run without backend import
-    MotorController = None  # type: ignore[assignment]
+from hardware.motor_controller import MotorController
 
 LOGGER = logging.getLogger("combined.app")
 

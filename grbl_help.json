@@ -1,0 +1,211 @@
+{
+  "grbl_version": "1.1h",
+  "build_date": "2019-08-25",
+  "settings": {
+    "motion_parameters": {
+      "$0": { 
+        "name": "Step pulse time", 
+        "value": 10, 
+        "unit": "microseconds", 
+        "description": "Time for which step pulse is active for each step command. Default value is 10 microseconds."
+      },
+      "$1": { 
+        "name": "Step idle delay", 
+        "value": 25, 
+        "unit": "milliseconds", 
+        "description": "Idle time between step pulses during motion. Default value is 25 milliseconds."
+      },
+      "$2": { 
+        "name": "Step pulse invert", 
+        "value": 0, 
+        "description": "Step pulse invert logic. A value of 0 means no inversion."
+      },
+      "$3": { 
+        "name": "Step direction invert", 
+        "value": 0, 
+        "description": "Step direction invert logic. A value of 0 means no inversion."
+      },
+      "$4": { 
+        "name": "Step enable invert", 
+        "value": 0, 
+        "description": "Step enable invert logic. A value of 0 means no inversion."
+      },
+      "$5": { 
+        "name": "Limit pins invert", 
+        "value": 0, 
+        "description": "Invert logic of limit switches. Default value is 0."
+      },
+      "$6": { 
+        "name": "Probe pin invert", 
+        "value": 0, 
+        "description": "Invert logic of probe pin. Default value is 0."
+      }
+    },
+    "status_report": {
+      "$10": { 
+        "name": "Status report options", 
+        "value": 19, 
+        "description": "Defines what data to report in status updates. Default value is 19."
+      },
+      "$11": { 
+        "name": "Junction deviation", 
+        "value": 0.010, 
+        "unit": "mm", 
+        "description": "The maximum allowable deviation from a perfect arc in the motion planning. Default is 0.010 mm."
+      },
+      "$12": { 
+        "name": "Arc tolerance", 
+        "value": 0.002, 
+        "unit": "mm", 
+        "description": "Tolerance for arcs. The lower the value, the smoother the arc. Default is 0.002 mm."
+      },
+      "$13": { 
+        "name": "Report inches", 
+        "value": 0, 
+        "description": "Reports motion in millimeters by default (0 = mm, 1 = inches). Default value is 0 (mm)."
+      }
+    },
+    "limits_and_homing": {
+      "$20": { 
+        "name": "Soft limits enable", 
+        "value": 0, 
+        "description": "Enable soft limits to prevent movement beyond defined boundaries. Default value is 0."
+      },
+      "$21": { 
+        "name": "Hard limits enable", 
+        "value": 1, 
+        "description": "Enable hard limits (limit switches) for stopping motion. Default value is 1."
+      },
+      "$22": { 
+        "name": "Homing cycle enable", 
+        "value": 0, 
+        "description": "Enable homing cycle. Default value is 0 (disabled)."
+      },
+      "$23": { 
+        "name": "Homing direction invert", 
+        "value": 0, 
+        "description": "Invert homing direction. Default value is 0 (no inversion)."
+      },
+      "$24": { 
+        "name": "Homing locate feed rate", 
+        "value": 25.000, 
+        "unit": "mm/min", 
+        "description": "Feed rate during homing locate cycle. Default value is 25.000 mm/min."
+      },
+      "$25": { 
+        "name": "Homing search seek rate", 
+        "value": 500.000, 
+        "unit": "mm/min", 
+        "description": "Feed rate during the homing search sequence. Default value is 500.000 mm/min."
+      },
+      "$26": { 
+        "name": "Homing switch debounce delay", 
+        "value": 250, 
+        "unit": "milliseconds", 
+        "description": "Debounce time for homing switches. Default value is 250 ms."
+      },
+      "$27": { 
+        "name": "Homing pull‑off distance", 
+        "value": 1.000, 
+        "unit": "mm", 
+        "description": "Pull-off distance after homing cycle. Default value is 1.000 mm."
+      }
+    },
+    "axis_parameters": {
+      "$100": { 
+        "name": "X steps per mm", 
+        "value": 250.000, 
+        "description": "Steps required for the X-axis to move 1 mm. Default value is 250 steps/mm."
+      },
+      "$101": { 
+        "name": "Y steps per mm", 
+        "value": 250.000, 
+        "description": "Steps required for the Y-axis to move 1 mm. Default value is 250 steps/mm."
+      },
+      "$102": { 
+        "name": "Z steps per mm", 
+        "value": 250.000, 
+        "description": "Steps required for the Z-axis to move 1 mm. Default value is 250 steps/mm."
+      },
+      "$110": { 
+        "name": "X max rate", 
+        "value": 1000.000, 
+        "unit": "mm/min", 
+        "description": "Maximum feed rate for the X-axis. Default value is 1000 mm/min."
+      },
+      "$111": { 
+        "name": "Y max rate", 
+        "value": 1000.000, 
+        "unit": "mm/min", 
+        "description": "Maximum feed rate for the Y-axis. Default value is 1000 mm/min."
+      },
+      "$112": { 
+        "name": "Z max rate", 
+        "value": 500.000, 
+        "unit": "mm/min", 
+        "description": "Maximum feed rate for the Z-axis. Default value is 500 mm/min."
+      },
+      "$120": { 
+        "name": "X acceleration", 
+        "value": 30.000, 
+        "unit": "mm/sec²", 
+        "description": "Acceleration rate for the X-axis. Default value is 30 mm/sec²."
+      },
+      "$121": { 
+        "name": "Y acceleration", 
+        "value": 30.000, 
+        "unit": "mm/sec²", 
+        "description": "Acceleration rate for the Y-axis. Default value is 30 mm/sec²."
+      },
+      "$122": { 
+        "name": "Z acceleration", 
+        "value": 30.000, 
+        "unit": "mm/sec²", 
+        "description": "Acceleration rate for the Z-axis. Default value is 30 mm/sec²."
+      },
+      "$130": { 
+        "name": "X max travel", 
+        "value": 200.000, 
+        "unit": "mm", 
+        "description": "Maximum allowable movement for the X-axis. Default value is 200 mm."
+      },
+      "$131": { 
+        "name": "Y max travel", 
+        "value": 200.000, 
+        "unit": "mm", 
+        "description": "Maximum allowable movement for the Y-axis. Default value is 200 mm."
+      },
+      "$132": { 
+        "name": "Z max travel", 
+        "value": 200.000, 
+        "unit": "mm", 
+        "description": "Maximum allowable movement for the Z-axis. Default value is 200 mm."
+      }
+    },
+    "motion_optimization": {
+      "$30": { 
+        "name": "Max feed rate", 
+        "value": 1000, 
+        "unit": "mm/min", 
+        "description": "Maximum feed rate for movements. Default value is 1000 mm/min."
+      },
+      "$31": { 
+        "name": "Min feed rate", 
+        "value": 0, 
+        "unit": "mm/min", 
+        "description": "Minimum feed rate for movements. Default value is 0 mm/min."
+      },
+      "$32": { 
+        "name": "Z min travel", 
+        "value": 0, 
+        "unit": "mm", 
+        "description": "Minimum travel for Z-axis. Default value is 0 mm."
+      }
+    }
+  },
+  "additional_resources": {
+    "grbl_docs": "https://github.com/gnea/grbl/wiki",
+    "grbl_config_reference": "https://github.com/gnea/grbl/wiki/Grbl-v1.1-Configuration?utm_source=chatgpt.com",
+    "grbl_version_1.1h_release_notes": "https://github.com/gnea/grbl/releases/tag/v1.1h?utm_source=chatgpt.com"
+  }
+}
