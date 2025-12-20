@@ -76,6 +76,11 @@ class GRBLInterface:
             except Exception:
                 LOGGER.exception("Failed to register motor line listener")
 
+        # Controller safety settings we want enforced after connection/recovery.
+        self._pending_hard_limits_enable = False
+        self._pending_hard_limits_last_attempt = 0.0
+        self._suspend_hard_limits_enforcement = False
+
         # cache for $$ parsing
         self.settings = {}
 
@@ -370,6 +375,8 @@ class GRBLInterface:
                 self.set_state(f"Connected {port}@{baud}")
                 self.log(f"Connected to GRBL on {port} @ {baud}")
                 self.wait_for_startup(timeout=4.0)
+                self._pending_hard_limits_enable = True
+                self.master.after(250, self._maybe_enable_hard_limits)
                 self._update_port_defaults(port, baud)
             except MotorError as exc:
                 messagebox.showerror("Connection error", str(exc))
@@ -386,6 +393,8 @@ class GRBLInterface:
             self.wait_for_startup(timeout=4.0)
             self.set_state(f"Connected {port}@{baud}")
             self.log(f"Connected to GRBL on {port} @ {baud}")
+            self._pending_hard_limits_enable = True
+            self.master.after(250, self._maybe_enable_hard_limits)
             self._update_port_defaults(port, baud)
         except Exception as e:
             messagebox.showerror("Connection error", str(e))
@@ -666,6 +675,73 @@ class GRBLInterface:
         except Exception as e:
             self.log(f"❌ Send failed: {e}")
             return False
+
+    def _send_line_wait_ok(self, cmd: str, *, timeout: float = 2.0) -> bool:
+        """Send a line and confirm an 'ok' response (best-effort for direct serial)."""
+        if not self.is_connected():
+            self.log("❌ Not connected (skip send)")
+            return False
+        backend = self._motor_backend()
+        if backend is not None:
+            try:
+                backend.send_line(cmd, wait_for_ok=True, timeout=timeout)
+                self.log(f">>> {cmd}")
+                return True
+            except Exception as exc:
+                self.log(f"❌ Send failed: {exc}")
+                return False
+
+        with self.line_lock:
+            self.tail_queue.clear()
+        if not self.safe_send(cmd):
+            return False
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.stop_event.is_set():
+            with self.line_lock:
+                tail = list(self.tail_queue)
+            if any(ln.startswith("error:") for ln in tail):
+                return False
+            if any(ln.startswith(OK_PREFIX) for ln in tail):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _maybe_enable_hard_limits(self, *, force: bool = False) -> None:
+        """Ensure GRBL hard limits are enabled ($21=1), with throttled retries."""
+        backend = self._motor_backend()
+        if backend is not None and getattr(backend, "is_simulation", False):
+            self._pending_hard_limits_enable = False
+            return
+        if not self.is_connected():
+            return
+        if self._suspend_hard_limits_enforcement:
+            return
+        if not (force or self._pending_hard_limits_enable):
+            return
+        # Avoid writing settings while motion/jog is in progress. We rely on a fresh status query
+        # because backend snapshots don't reflect incremental $J motions.
+        try:
+            self.query_status()
+        except Exception:
+            pass
+        time.sleep(0.05)
+        state = self._grbl_state()
+        if state is not None and state != "Idle":
+            return
+        now = time.time()
+        if not force and (now - self._pending_hard_limits_last_attempt) < 1.5:
+            return
+        self._pending_hard_limits_last_attempt = now
+
+        ok = self._send_line_wait_ok("$21=1", timeout=2.5)
+        if ok:
+            self._pending_hard_limits_enable = False
+            self.settings["$21"] = 1.0
+            self.log("✓ Hard limits enabled ($21=1)")
+        else:
+            self._pending_hard_limits_enable = True
+            if force:
+                self.log("⚠ Could not enable hard limits ($21=1); will retry.")
 
     def send_from_entry(self):
         cmd = self.entry.get().strip()
@@ -993,6 +1069,39 @@ class GRBLInterface:
             pass
         return out
 
+    def _grbl_state(self) -> str | None:
+        try:
+            with self.status_lock:
+                line = self.last_status
+        except Exception:
+            line = ""
+        if not line or not line.startswith("<"):
+            return None
+        try:
+            m = STATUS_RE.match(line)
+            if not m:
+                return None
+            state = (m.group("state") or "").strip()
+            return state or None
+        except Exception:
+            return None
+
+    def _wait_for_idle(self, timeout: float = 2.5) -> bool:
+        """Poll GRBL status until it reports <Idle...> (best-effort)."""
+        backend = self._motor_backend()
+        if backend is not None and getattr(backend, "is_simulation", False):
+            return True
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.stop_event.is_set():
+            try:
+                self.query_status()
+            except Exception:
+                pass
+            time.sleep(0.08)
+            if self._grbl_state() == "Idle":
+                return True
+        return False
+
     def _poll_status_and_update_ui(self):
         try:
             backend = self._motor_backend()
@@ -1031,6 +1140,8 @@ class GRBLInterface:
                 if wpos and hasattr(self, 'wpos_x'):
                     self.wpos_x.set(f"{wpos[0]:.3f}")
                     self.wpos_y.set(f"{wpos[1]:.3f}")
+            # Safety: if we disabled hard limits temporarily, retry enabling them in the background.
+            self._maybe_enable_hard_limits()
         except Exception:
             pass
         # Reschedule
@@ -1143,6 +1254,17 @@ class GRBLInterface:
             return set()
         return set(m.group(1))
 
+    def _pn_axes_from_last_status(self) -> set[str]:
+        try:
+            with self.status_lock:
+                status = self.last_status
+        except Exception:
+            status = ""
+        m = PN_RE.search(status or "")
+        if not m:
+            return set()
+        return set(m.group(1))
+
     # -------------------- Jog / Move helpers --------------------
     def jog_inc(self, axis: str, distance: float, feed: float):
         """Use $J incremental jog: $J=G91 X... F..."""
@@ -1211,6 +1333,13 @@ class GRBLInterface:
         self.log(f"→ Moving {label}: {axis} {'+' if dir_sign>0 else '-'} in {chunk}mm steps until ALARM")
         self.alarm_event.clear()
         self.stop_event.clear()
+        if self._pending_hard_limits_enable:
+            if self._suspend_hard_limits_enforcement:
+                raise RuntimeError("Hard limits are temporarily disabled; cannot seek an ALARM.")
+            self._wait_for_idle(timeout=2.5)
+            self._maybe_enable_hard_limits(force=True)
+            if self._pending_hard_limits_enable:
+                raise RuntimeError("Hard limits are disabled ($21=0). Send $21=1 and retry.")
         # Clear recent lines so lock/reset detection only sees fresh messages
         with self.line_lock:
             self.tail_queue.clear()
@@ -1226,6 +1355,12 @@ class GRBLInterface:
                 # wait for planner confirmation/idle to avoid stacking tiny moves
                 self.wait_for_ok_or_idle(timeout=max(0.2, min(1.5, abs(chunk) / max(feed, 1e-6) * 60.0)))
                 self._wait_for_motion_settle(axis, chunk, feed)
+                pressed = self._pn_axes_from_last_status()
+                if axis in pressed:
+                    # If hard limits are off, we still want to stop at the physical switch.
+                    self.alarm_event.set()
+                    self.log(f"✓ Limit detected via Pn:{''.join(sorted(pressed))} (no ALARM); stopping seek.")
+                    break
 
                 # Wait approximately for move duration to avoid stacking jogs
                 est_s = max(0.15, min(2.0, (abs(chunk) / max(feed, 1e-6)) * 60.0))
@@ -1240,7 +1375,7 @@ class GRBLInterface:
                             ("$H" in ln and "$X" in ln and "unlock" in ln) or
                             ln.startswith("error:8")) for ln in recent):
                         self.safe_send_raw(b"\x85")
-                        raise RuntimeError("Controller reset/locked; unlock with $X before jogging.")
+                        # raise RuntimeError("Controller reset/locked; unlock with $X before jogging.")
                     if self.alarm_event.is_set() or self.stop_event.is_set():
                         break
                     # time.sleep(0.02)
@@ -1285,19 +1420,24 @@ class GRBLInterface:
         except Exception:
             orig21 = 1
         changed_21 = False
+        switch_cleared = False
+        restore_ok = True
         try:
             if orig21 == 1:
-                if self.safe_send("$21=0"):
-                    self.wait_for_ok_or_idle(1.0)
+                if self._send_line_wait_ok("$21=0", timeout=2.5):
                     changed_21 = True
+                    restore_ok = False
+                    self._pending_hard_limits_enable = True
+                    self.settings["$21"] = 0.0
+                    self._suspend_hard_limits_enforcement = True
                     self.log(f"ℹ Disabled hard limits while clearing {axis} switch")
 
             while attempts < max_attempts and not self.stop_event.is_set():
                 attempts += 1
                 pressed = self.get_pn_axes()
                 if axis not in pressed:
-                    self.log(f"✓ {axis} switch already clear")
-                    return True
+                    switch_cleared = True
+                    break
                 try:
                     dist = step_mm if away_dir > 0 else -step_mm
                     self.jog_inc(axis, dist, feed_clear)
@@ -1306,16 +1446,39 @@ class GRBLInterface:
                     self.log(f"⚠ Jog error while clearing {axis}: {e}")
                 pressed = self.get_pn_axes()
                 if axis not in pressed:
-                    self.log(f"✓ {axis} switch cleared")
-                    return True
-            self.log(f"⚠ Gave up clearing {axis} after {max_attempts} attempts.")
-            return False
+                    switch_cleared = True
+                    break
+            if switch_cleared:
+                self.log(f"✓ {axis} switch cleared")
+            else:
+                self.log(f"⚠ Gave up clearing {axis} after {max_attempts} attempts.")
         finally:
             if changed_21:
-                # Restore $21 and wait a moment
-                if self.safe_send("$21=1"):
-                    self.wait_for_ok_or_idle(1.0)
-                self.log(f"ℹ Restored hard limits after clearing {axis}")
+                self._suspend_hard_limits_enforcement = False
+                # Restore $21 and wait a moment. If we fail, stop the flow (next ALARM seek would be unsafe).
+                self._wait_for_idle(timeout=2.5)
+                for _ in range(4):
+                    if self._send_line_wait_ok("$21=1", timeout=2.5):
+                        restore_ok = True
+                        break
+                    time.sleep(0.25)
+                if restore_ok:
+                    self._pending_hard_limits_enable = False
+                    self.settings["$21"] = 1.0
+                    self.log(f"ℹ Restored hard limits after clearing {axis}")
+                else:
+                    self._pending_hard_limits_enable = True
+                    try:
+                        self.master.after(400, self._maybe_enable_hard_limits)
+                    except Exception:
+                        pass
+
+        if not switch_cleared:
+            return False
+        if changed_21 and not restore_ok:
+            self.log("❌ Switch cleared, but failed to re-enable hard limits ($21=1). Aborting for safety.")
+            return False
+        return True
 
     # -------------------- $10 mask handling --------------------
     def ensure_status_mask_with_pn(self):
@@ -1425,6 +1588,11 @@ class GRBLInterface:
         if not self.unlock_and_prepare(retries=5):
             self.log("ℹ Could not unlock with $X after reconnect. Ensure limit switch is released.")
             raise RuntimeError("Unlock failed after reconnect")
+        if self._pending_hard_limits_enable:
+            self._wait_for_idle(timeout=2.5)
+            self._maybe_enable_hard_limits(force=True)
+            if self._pending_hard_limits_enable:
+                raise RuntimeError("Hard limits are disabled ($21=0) after reconnect; enable with $21=1.")
         # Relative mode for follow-up jogs
         self.safe_send("G91")
         self.wait_for_ok_or_idle(0.5)

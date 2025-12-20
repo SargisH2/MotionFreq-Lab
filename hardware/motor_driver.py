@@ -108,6 +108,7 @@ class SerialMotorDriver:
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_stop = threading.Event()
         self._response_queue: "queue.Queue[str]" = queue.Queue(maxsize=64)
+        self._write_lock = threading.Lock()
         self._listener_counter = count(1)
         self._line_listeners: dict[int, LineListener] = {}
         self._listener_lock = threading.Lock()
@@ -275,6 +276,14 @@ class SerialMotorDriver:
             return
         raise MotorError(response)
 
+    def _drain_response_queue(self) -> None:
+        """Remove any queued ok/error/alarm responses from prior non-blocking sends."""
+        try:
+            while True:
+                self._response_queue.get_nowait()
+        except queue.Empty:
+            return
+
     def _send_command_blocking(self, command: str, *, timeout: float = 5.0) -> None:
         handle = self._serial_handle
         if handle is None:
@@ -353,14 +362,17 @@ class SerialMotorDriver:
         handle = self._serial_handle
         if handle is None:
             raise MotorError("Serial handle not available.")
-        if not command.endswith("\r\n"):
-            command = f"{command}\r\n"
-        self._logger.debug("-> %s", command.strip())
-        out = command.encode("ascii")
-        handle.write(out)
-        handle.flush()
-        if wait_for_ok and not self.is_simulation:
-            self._await_ok(timeout)
+        with self._write_lock:
+            if wait_for_ok and not self.is_simulation:
+                self._drain_response_queue()
+            if not command.endswith("\r\n"):
+                command = f"{command}\r\n"
+            self._logger.debug("-> %s", command.strip())
+            out = command.encode("ascii")
+            handle.write(out)
+            handle.flush()
+            if wait_for_ok and not self.is_simulation:
+                self._await_ok(timeout)
 
     def _send_realtime(self, payload: bytes) -> None:  # pragma: no cover - hardware helper
         if not payload:
@@ -368,8 +380,9 @@ class SerialMotorDriver:
         handle = self._serial_handle
         if handle is None:
             raise MotorError("Serial handle not available.")
-        handle.write(payload)
-        handle.flush()
+        with self._write_lock:
+            handle.write(payload)
+            handle.flush()
 
 
 __all__ = [
