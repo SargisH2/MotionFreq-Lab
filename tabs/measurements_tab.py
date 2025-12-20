@@ -70,6 +70,7 @@ class PlotRuntime:
     buffer: MeasurementBuffer
     mode: Optional[ModeLiteral] = None
     thread: Optional[threading.Thread] = None
+    motor_thread: Optional[threading.Thread] = None
     stop_event: Optional[threading.Event] = None
     start_monotonic: float = 0.0
     start_time: Optional[datetime] = None
@@ -78,6 +79,7 @@ class PlotRuntime:
     last_jog_command_time: float = 0.0
     last_measurement_finished_at: float = 0.0
     next_measurement_not_before: float = 0.0
+    last_coordinate_mm: float = 0.0
 
 
 class PlotCard(ttk.LabelFrame):
@@ -841,6 +843,14 @@ class MeasurementsTab(ttk.Frame):
         runtime.last_jog_command_time = now
         runtime.last_measurement_finished_at = now
         runtime.next_measurement_not_before = now
+        runtime.last_coordinate_mm = 0.0
+        runtime.motor_thread = None
+
+        if mode != "no_motor_time" and self._motor.is_connected():
+            try:
+                runtime.last_coordinate_mm = float(self._motor.get_position(axis))
+            except Exception:
+                pass
 
         step_distance = self._sanitize_step_value()
 
@@ -852,6 +862,17 @@ class MeasurementsTab(ttk.Frame):
         )
         runtime.thread = thread
         thread.start()
+
+        if mode in {"pos_from_zero", "neg_from_zero"}:
+            direction = +1 if mode == "pos_from_zero" else -1
+            motor_thread = threading.Thread(
+                target=self._motor_loop,
+                name=f"MotorLoop-{plot_id}",
+                args=(runtime, axis, direction, step_distance),
+                daemon=True,
+            )
+            runtime.motor_thread = motor_thread
+            motor_thread.start()
 
         if mode != "no_motor_time":
             self._active_motor_plot = plot_id
@@ -878,6 +899,9 @@ class MeasurementsTab(ttk.Frame):
         thread = runtime.thread
         if thread and thread.is_alive() and not from_thread:
             thread.join(timeout=2.0)
+        motor_thread = runtime.motor_thread
+        if motor_thread and motor_thread.is_alive() and not from_thread:
+            motor_thread.join(timeout=2.0)
         if previous_mode in {"pos_from_zero", "neg_from_zero"} and self._motor.is_connected():
             try:
                 self._logger.debug("Issuing realtime jog cancel")
@@ -891,6 +915,7 @@ class MeasurementsTab(ttk.Frame):
             except MotorError as exc:
                 LOGGER.warning("Failed to stop motor during measurement shutdown: %s", exc)
         runtime.thread = None
+        runtime.motor_thread = None
         runtime.stop_event = None
         runtime.mode = None
         runtime.card.set_running(None)
@@ -910,34 +935,17 @@ class MeasurementsTab(ttk.Frame):
         stop_event = runtime.stop_event
         if stop_event is None:
             return
-        speed = max(1.0, self._sanitize_speed_value())
         step_distance = max(0.001, float(step_distance or 0.0))
-        direction = 0
         freq_iter: Optional[Iterator[Tuple[float, float]]] = None
         use_iter = mode == "no_motor_time"
-        runtime.next_measurement_not_before = max(runtime.next_measurement_not_before, time.perf_counter())
         try:
-            if mode == "pos_from_zero":
-                self._logger.debug("Homing axis %s before positive sweep", axis)
-                self._motor.home(axis)
-                runtime.next_measurement_not_before = time.perf_counter() + MOTOR_SETTLE_INTERVAL
-                direction = +1
-            elif mode == "neg_from_zero":
-                self._logger.debug("Homing axis %s before negative sweep", axis)
-                self._motor.home(axis)
-                runtime.next_measurement_not_before = time.perf_counter() + MOTOR_SETTLE_INTERVAL
-                direction = -1
-
             interval = max(0.0, self._daq_interval_sec)
             auto_trigger = bool(self._daq_auto_trigger)
             def _read_single() -> Optional[Tuple[float, float]]:
                 measurement_interval = interval
                 if self._daq.is_simulation:
                     measurement_interval = max(measurement_interval, SAMPLING_INTERVAL)
-                ready_at = max(
-                    runtime.next_measurement_not_before,
-                    runtime.last_measurement_finished_at + measurement_interval,
-                )
+                ready_at = runtime.last_measurement_finished_at + measurement_interval
                 delay = ready_at - time.perf_counter()
                 if delay > 0:
                     if stop_event.wait(delay):
@@ -986,10 +994,11 @@ class MeasurementsTab(ttk.Frame):
                     if mode != "no_motor_time" and self._motor.is_connected():
                         try:
                             coordinate_mm = self._motor.get_position(axis)
+                            runtime.last_coordinate_mm = float(coordinate_mm)
                         except MotorError:
-                            coordinate_mm = 0.0
+                            coordinate_mm = runtime.last_coordinate_mm
                     else:
-                        coordinate_mm = 0.0
+                        coordinate_mm = runtime.last_coordinate_mm
 
                     elapsed = time.perf_counter() - runtime.start_monotonic
                     if mode == "no_motor_time":
@@ -999,43 +1008,9 @@ class MeasurementsTab(ttk.Frame):
                         coordinate = self._mm_to_mm(coordinate_mm)
                         x_value = coordinate
                     self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate, x_value, elapsed, timestamp)
-                    if direction != 0 and not stop_event.is_set():
-                        try:
-                            if not self._wait_for_motor_ready(runtime, stop_event):
-                                break
-                            jog_start = time.perf_counter()
-                            runtime.last_jog_command_time = jog_start
-                            estimated_duration = abs(step_distance) / max(speed, 1e-9) * 60.0
-                            self._logger.debug(
-                                "Jogging axis %s by %.3f (dir=%s, feed=%s, est=%.3fs)",
-                                axis,
-                                step_distance,
-                                direction,
-                                speed,
-                                estimated_duration,
-                            )
-                            runtime.next_measurement_not_before = max(
-                                runtime.next_measurement_not_before,
-                                jog_start + estimated_duration,
-                            )
-                            if not self._jog_with_retry(axis, direction * step_distance, speed, stop_event):
-                                break
-                            jog_end = time.perf_counter()
-                            runtime.last_move_duration = jog_end - jog_start
-                            runtime.next_measurement_not_before = jog_end + MOTOR_SETTLE_INTERVAL
-                            self._logger.debug(
-                                "Motor jog complete: axis=%s dir=%s step=%.3f feed=%s duration=%.3fs",
-                                axis,
-                                direction,
-                                step_distance,
-                                speed,
-                                runtime.last_move_duration,
-                            )
-                        except MotorError as exc:
-                            self._report_error(f"Motor jog failed: {exc}")
-                            break
         except MotorError as exc:
-            self._report_error(str(exc))
+            # Motor errors should not prevent DAQ-only capture.
+            self._logger.warning("Motor error during acquisition; continuing: %s", exc)
         finally:
             if freq_iter is not None:
                 try:
@@ -1046,6 +1021,48 @@ class MeasurementsTab(ttk.Frame):
             if mode != "no_motor_time":
                 self._motor.stop()
             self.after(0, lambda pid=runtime.plot_id: self._stop_measurement(pid, from_thread=True))
+
+    def _motor_loop(self, runtime: PlotRuntime, axis: str, direction: int, step_distance: float) -> None:
+        """Background loop that advances the motor independently of DAQ sampling."""
+        stop_event = runtime.stop_event
+        if stop_event is None:
+            return
+        if not self._motor.is_connected():
+            return
+        if direction not in (-1, +1):
+            return
+        step_distance = max(0.001, float(step_distance or 0.0))
+        speed = max(1.0, self._sanitize_speed_value())
+        try:
+            try:
+                self._logger.debug("Homing axis %s before sweep (dir=%s)", axis, direction)
+                self._motor.home(axis)
+                runtime.last_coordinate_mm = 0.0
+                time.sleep(MOTOR_SETTLE_INTERVAL)
+            except MotorError as exc:
+                self._logger.warning("Motor home failed; motor thread exiting: %s", exc)
+                return
+
+            while not stop_event.is_set():
+                try:
+                    runtime.last_jog_command_time = time.perf_counter()
+                    self._motor.jog_increment(axis, direction * step_distance, speed)
+                    runtime.last_move_duration = max(0.0, time.perf_counter() - runtime.last_jog_command_time)
+                except MotorError as exc:
+                    self._logger.warning("Motor jog failed; motor thread exiting: %s", exc)
+                    try:
+                        self._motor.stop()
+                    except Exception:
+                        pass
+                    return
+                # Small pause to avoid hammering the controller with back-to-back jogs.
+                if stop_event.wait(MOTOR_SETTLE_INTERVAL):
+                    break
+        finally:
+            try:
+                self._motor.stop()
+            except Exception:
+                pass
 
     def _record_measurement(
         self,
