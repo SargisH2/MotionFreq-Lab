@@ -80,6 +80,7 @@ class GRBLInterface:
         self._pending_hard_limits_enable = False
         self._pending_hard_limits_last_attempt = 0.0
         self._suspend_hard_limits_enforcement = False
+        self._persist_after_id: Optional[str] = None
 
         # cache for $$ parsing
         self.settings = {}
@@ -113,11 +114,14 @@ class GRBLInterface:
         self.port_cmb = ttk.Combobox(top, width=16, state="readonly", values=initial_ports)
         self._apply_default_port_selection(force=True, ports=list(initial_ports))
         self.port_cmb.grid(row=0, column=1, padx=4)
+        self.port_cmb.bind("<<ComboboxSelected>>", lambda _: self._schedule_persist_motor_config())
 
         ttk.Label(top, text="Baud:").grid(row=0, column=2, sticky="w")
         self.baud_entry = ttk.Entry(top, width=8)
         self.baud_entry.insert(0, str(cfg.default_baud))
         self.baud_entry.grid(row=0, column=3, padx=4)
+        self.baud_entry.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.baud_entry.bind("<Return>", lambda _: self._schedule_persist_motor_config())
 
         ttk.Button(top, text="Connect", command=self.connect).grid(row=0, column=4, padx=4)
         ttk.Button(top, text="Disconnect", command=self.disconnect).grid(row=0, column=5, padx=4)
@@ -136,23 +140,29 @@ class GRBLInterface:
         axes.grid(row=0, column=0, sticky="nsew", padx=(0,8))
         self.x_en = tk.BooleanVar(value=cfg.axis_enabled.get("X", True))
         self.y_en = tk.BooleanVar(value=cfg.axis_enabled.get("Y", False))
-        ttk.Checkbutton(axes, text="X", variable=self.x_en).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(axes, text="Y", variable=self.y_en).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(axes, text="X", variable=self.x_en, command=self._schedule_persist_motor_config).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(axes, text="Y", variable=self.y_en, command=self._schedule_persist_motor_config).grid(row=0, column=1, sticky="w")
 
         ttk.Label(axes, text="Homing Feed (mm/min):").grid(row=1, column=0, sticky="w")
         self.feed_entry = ttk.Entry(axes, width=10)
         self.feed_entry.insert(0, format(cfg.homing_feed, "g"))
         self.feed_entry.grid(row=1, column=1, sticky="w")
+        self.feed_entry.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.feed_entry.bind("<Return>", lambda _: self._schedule_persist_motor_config())
 
         ttk.Label(axes, text="Clear (mm):").grid(row=2, column=0, sticky="w")
         self.clear_entry = ttk.Entry(axes, width=10)
         self.clear_entry.insert(0, format(cfg.homing_clearance, "g"))
         self.clear_entry.grid(row=2, column=1, sticky="w")
+        self.clear_entry.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.clear_entry.bind("<Return>", lambda _: self._schedule_persist_motor_config())
 
         ttk.Label(axes, text="Long jog (mm):").grid(row=3, column=0, sticky="w")
         self.long_entry = ttk.Entry(axes, width=10)
         self.long_entry.insert(0, format(cfg.homing_long_jog, "g"))
         self.long_entry.grid(row=3, column=1, sticky="w")
+        self.long_entry.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.long_entry.bind("<Return>", lambda _: self._schedule_persist_motor_config())
 
         # Quick command buttons
         quick = ttk.LabelFrame(mid, text="Quick Commands")
@@ -181,9 +191,13 @@ class GRBLInterface:
         ttk.Label(jog, text="Step (mm):").grid(row=0, column=0, sticky="w")
         self.jog_step = ttk.Entry(jog, width=8); self.jog_step.insert(0, format(cfg.jog_step, "g"))
         self.jog_step.grid(row=0, column=1, sticky="w", padx=(0,6))
+        self.jog_step.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.jog_step.bind("<Return>", lambda _: self._schedule_persist_motor_config())
         ttk.Label(jog, text="Feed (mm/min):").grid(row=1, column=0, sticky="w")
         self.jog_feed = ttk.Entry(jog, width=8); self.jog_feed.insert(0, format(cfg.jog_feed, "g"))
         self.jog_feed.grid(row=1, column=1, sticky="w", padx=(0,6))
+        self.jog_feed.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.jog_feed.bind("<Return>", lambda _: self._schedule_persist_motor_config())
         row_btns = 2
         ttk.Button(jog, text="X +", command=lambda: self.manual_jog("X", +1)).grid(row=row_btns, column=0, sticky="ew", padx=4, pady=2)
         ttk.Button(jog, text="X −", command=lambda: self.manual_jog("X", -1)).grid(row=row_btns, column=1, sticky="ew", padx=4, pady=2)
@@ -244,6 +258,8 @@ class GRBLInterface:
         self.goto_feed = ttk.Entry(posctl, width=10)
         self.goto_feed.insert(0, format(cfg.goto_feed, "g"))
         self.goto_feed.grid(row=2, column=10, sticky="w", padx=(4,8), pady=(4,0))
+        self.goto_feed.bind("<FocusOut>", lambda _: self._schedule_persist_motor_config())
+        self.goto_feed.bind("<Return>", lambda _: self._schedule_persist_motor_config())
 
         ttk.Button(posctl, text="Move", command=self.move_to_coords).grid(row=2, column=11, sticky="ew", padx=(8,0), pady=(4,0))
 
@@ -553,6 +569,18 @@ class GRBLInterface:
             LOGGER.exception("Failed to save motor config", exc_info=True)
         else:
             self._motor_config = cfg
+
+    def _schedule_persist_motor_config(self, delay_ms: int = 250) -> None:
+        """Debounce config writes while the user is editing fields."""
+        try:
+            if self._persist_after_id is not None:
+                self.master.after_cancel(self._persist_after_id)
+        except Exception:
+            pass
+        try:
+            self._persist_after_id = self.master.after(delay_ms, self._persist_motor_config)
+        except Exception:
+            self._persist_after_id = None
 
     def _motor_backend(self) -> Optional[MotorController]:
         if not self._use_motor_backend:

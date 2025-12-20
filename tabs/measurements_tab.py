@@ -54,13 +54,11 @@ MODE_LABELS: Dict[ModeLiteral, str] = {
 
 MODE_XLABELS: Dict[ModeLiteral, str] = {
     "no_motor_time": "Time (s)",
-    "pos_from_zero": "Coordinate (steps)",
-    "neg_from_zero": "Coordinate (steps)",
+    "pos_from_zero": "Coordinate (mm)",
+    "neg_from_zero": "Coordinate (mm)",
 }
 
 SIMULATED_PORT_NAME = "Simulated Motor"
-# Default steps/mm fallback if $100/$101 are not read yet (GRBL default for our setup)
-DEFAULT_STEPS_PER_MM = 1600.0
 
 
 @dataclass
@@ -194,15 +192,12 @@ class MeasurementsTab(ttk.Frame):
         self._motor = motor or MotorController()
         self._motor_config: MotorConfig = load_motor_config()
         self._last_motor_connected = self._motor.is_connected()
-        # Parsed GRBL settings (best-effort). Used for steps/mm conversions.
-        self.settings: Dict[str, float] = {}
         self._plots: Dict[PlotIdLiteral, PlotRuntime] = {}
         self._status_poll_id: Optional[str] = None
         self._active_motor_plot: Optional[PlotIdLiteral] = None
         self._daq_interval_sec = 0.0
         self._daq_auto_trigger = True
         self._active_daq_plot: Optional[PlotIdLiteral] = None
-        self._steps_warned: set[str] = set()
 
         self._build_ui()
         self._poll_status()
@@ -210,26 +205,9 @@ class MeasurementsTab(ttk.Frame):
 
     # ------------------------------------------------------------------ #
     # Unit helpers
-    def _steps_per_mm(self, axis: str) -> float:
-        """Return configured steps/mm for an axis, falling back to a sensible default."""
-
-        key = "$100" if axis.upper() == "X" else "$101"
+    def _mm_to_mm(self, value_mm: float) -> float:
         try:
-            raw = float(self.settings.get(key, DEFAULT_STEPS_PER_MM))
-        except Exception:
-            raw = DEFAULT_STEPS_PER_MM
-        if raw <= 0:
-            raw = DEFAULT_STEPS_PER_MM
-        if key not in self._steps_warned and key not in self.settings:
-            self._steps_warned.add(key)
-            self._logger.info("Using default steps/mm (%g) for %s; read $$ to load %s", raw, axis.upper(), key)
-        return raw
-
-    def _mm_to_steps(self, value_mm: float, axis: str) -> float:
-        """Convert a distance in mm to motor steps using the configured steps/mm."""
-
-        try:
-            return float(value_mm) * self._steps_per_mm(axis)
+            return float(value_mm)
         except Exception:
             return 0.0
 
@@ -245,14 +223,28 @@ class MeasurementsTab(ttk.Frame):
         top.columnconfigure(11, weight=1)
 
         cfg = self._motor_config
-        speed_default = max(1, min(1000, int(getattr(cfg, "default_speed", 100))))
-        axis_default = cfg.default_axis if cfg.default_axis in AXES else AXES[0]
+        speed_default = float(getattr(cfg, "jog_feed", 1600.0) or 1600.0)
+        axis_choices = [axis for axis in AXES if bool(cfg.axis_enabled.get(axis, True))]
+        if not axis_choices:
+            axis_choices = list(AXES)
+        axis_default = cfg.default_axis if cfg.default_axis in axis_choices else axis_choices[0]
         step_default = max(0.001, float(getattr(cfg, "jog_step", 1.0) or 1.0))
 
-        ttk.Label(top, text="Motor Speed:").grid(row=0, column=0, sticky="w")
-        self.speed_var = tk.IntVar(value=speed_default)
-        self.speed_spin = ttk.Spinbox(top, from_=1, to=1000, textvariable=self.speed_var, width=6)
+        ttk.Label(top, text="Motor Feed (mm/min):").grid(row=0, column=0, sticky="w")
+        self.speed_var = tk.DoubleVar(value=max(1.0, speed_default))
+        self.speed_spin = ttk.Spinbox(
+            top,
+            from_=1.0,
+            to=30000.0,
+            increment=10.0,
+            textvariable=self.speed_var,
+            width=8,
+            format="%.1f",
+            command=self._on_speed_changed,
+        )
         self.speed_spin.grid(row=0, column=1, padx=(4, 8))
+        self.speed_spin.bind("<FocusOut>", lambda _: self._on_speed_changed())
+        self.speed_spin.bind("<Return>", lambda _: self._on_speed_changed())
 
         ttk.Label(top, text="Step (mm):").grid(row=0, column=2, sticky="w")
         self.step_var = tk.DoubleVar(value=step_default)
@@ -272,7 +264,7 @@ class MeasurementsTab(ttk.Frame):
 
         ttk.Label(top, text="Axis:").grid(row=0, column=4, sticky="w")
         self.axis_var = tk.StringVar(value=axis_default)
-        self.axis_combo = ttk.Combobox(top, values=list(AXES), textvariable=self.axis_var, state="readonly", width=3)
+        self.axis_combo = ttk.Combobox(top, values=axis_choices, textvariable=self.axis_var, state="readonly", width=3)
         self.axis_combo.grid(row=0, column=5, padx=(4, 12))
 
         ttk.Label(top, text="Port:").grid(row=0, column=6, sticky="w")
@@ -428,6 +420,10 @@ class MeasurementsTab(ttk.Frame):
         """Refresh the port list from the environment."""
 
         self._motor_config = load_motor_config()
+        try:
+            self._sync_motor_controls_from_config(self._motor_config)
+        except Exception:
+            LOGGER.debug("Failed to sync motor controls from config", exc_info=True)
         ports = list(list_serial_ports())
         LOGGER.debug("Available ports: %s", ports)
 
@@ -445,6 +441,23 @@ class MeasurementsTab(ttk.Frame):
         self._update_connection_buttons()
         self._update_daq_buttons()
 
+    def _sync_motor_controls_from_config(self, cfg: MotorConfig) -> None:
+        """Update motor controls from the shared MotorConfig (without interrupting active runs)."""
+        any_running = any(runtime.mode is not None for runtime in self._plots.values())
+        if any_running:
+            return
+        axis_choices = [axis for axis in AXES if bool(cfg.axis_enabled.get(axis, True))]
+        if not axis_choices:
+            axis_choices = list(AXES)
+        self.axis_combo.configure(values=axis_choices)
+        current_axis = (self.axis_var.get() or "").upper()
+        if current_axis not in axis_choices:
+            self.axis_var.set(axis_choices[0])
+        feed = float(getattr(cfg, "jog_feed", 1600.0) or 1600.0)
+        self.speed_var.set(max(1.0, feed))
+        step = float(getattr(cfg, "jog_step", 1.0) or 1.0)
+        self.step_var.set(max(0.001, step))
+
     def connect_motor(self) -> None:
         """Connect the shared motor controller using the selected port."""
         port = self.port_var.get()
@@ -458,7 +471,8 @@ class MeasurementsTab(ttk.Frame):
             )
             return
         try:
-            self._motor.connect(port)
+            cfg = load_motor_config()
+            self._motor.connect(port, baudrate=int(getattr(cfg, "default_baud", 115200) or 115200))
         except MotorError as exc:
             LOGGER.exception("Motor connection failed")
             messagebox.showerror("Motor connection failed", f"Could not connect to {port}:\n{exc}")
@@ -514,6 +528,25 @@ class MeasurementsTab(ttk.Frame):
             messagebox.showerror("DAQ configuration failed", str(exc))
             return False
         return True
+
+    def _sanitize_speed_value(self) -> float:
+        """Ensure the feed value is a positive float (mm/min)."""
+        try:
+            value = float(self.speed_var.get())
+        except (tk.TclError, ValueError):
+            value = float(getattr(self._motor_config, "jog_feed", 1600.0) or 1600.0)
+        return max(1.0, value)
+
+    def _on_speed_changed(self) -> None:
+        """Clamp the feed value and persist it for future sessions."""
+        sanitized = self._sanitize_speed_value()
+        try:
+            current = float(self.speed_var.get())
+        except (tk.TclError, ValueError):
+            current = sanitized
+        if abs(current - sanitized) > 1e-6:
+            self.speed_var.set(sanitized)
+        self._persist_motor_config()
 
     def _sanitize_int(self, var: tk.IntVar, *, min_value: int, max_value: int, fallback: int) -> int:
         """Read a Tk IntVar safely, clamping to the provided bounds."""
@@ -600,7 +633,7 @@ class MeasurementsTab(ttk.Frame):
         attempts = 0
         while attempts <= MAX_JOG_RETRIES and not stop_event.is_set():
             try:
-                self._motor.jog_increment(axis, delta, speed)
+                self._motor.jog_increment(axis, delta, float(speed))
                 return True
             except MotorError as exc:
                 message = str(exc).lower()
@@ -620,11 +653,12 @@ class MeasurementsTab(ttk.Frame):
 
     def _capture_motor_config(self, cfg: MotorConfig) -> MotorConfig:
         """Copy the current UI values into a MotorConfig instance."""
+        cfg.jog_feed = self._sanitize_speed_value()
+        # Backward-compat value used by older UIs.
         try:
-            speed = int(self.speed_var.get())
+            cfg.default_speed = int(round(cfg.jog_feed))
         except Exception:
-            speed = cfg.default_speed
-        cfg.default_speed = max(1, min(1000, speed))
+            pass
 
         axis = (self.axis_var.get() or cfg.default_axis).upper()
         if axis not in AXES:
@@ -777,6 +811,11 @@ class MeasurementsTab(ttk.Frame):
 
     def _start_measurement(self, plot_id: PlotIdLiteral, mode: ModeLiteral) -> None:
         """Spawn the acquisition thread for the given plot/mode."""
+        try:
+            self._motor_config = load_motor_config()
+            self._sync_motor_controls_from_config(self._motor_config)
+        except Exception:
+            LOGGER.debug("Failed to sync motor controls before measurement start", exc_info=True)
         axis = self.axis_var.get()
         if mode != "no_motor_time":
             if not self._motor.is_connected():
@@ -871,7 +910,7 @@ class MeasurementsTab(ttk.Frame):
         stop_event = runtime.stop_event
         if stop_event is None:
             return
-        speed = max(1, self.speed_var.get())
+        speed = max(1.0, self._sanitize_speed_value())
         step_distance = max(0.001, float(step_distance or 0.0))
         direction = 0
         freq_iter: Optional[Iterator[Tuple[float, float]]] = None
@@ -955,11 +994,11 @@ class MeasurementsTab(ttk.Frame):
                     elapsed = time.perf_counter() - runtime.start_monotonic
                     if mode == "no_motor_time":
                         x_value = elapsed
-                        coordinate_steps = 0.0
+                        coordinate = 0.0
                     else:
-                        coordinate_steps = self._mm_to_steps(coordinate_mm, axis)
-                        x_value = coordinate_steps
-                    self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate_steps, x_value, elapsed, timestamp)
+                        coordinate = self._mm_to_mm(coordinate_mm)
+                        x_value = coordinate
+                    self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate, x_value, elapsed, timestamp)
                     if direction != 0 and not stop_event.is_set():
                         try:
                             if not self._wait_for_motor_ready(runtime, stop_event):
