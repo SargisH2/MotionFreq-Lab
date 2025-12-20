@@ -194,6 +194,8 @@ class MeasurementsTab(ttk.Frame):
         self._motor = motor or MotorController()
         self._motor_config: MotorConfig = load_motor_config()
         self._last_motor_connected = self._motor.is_connected()
+        # Parsed GRBL settings (best-effort). Used for steps/mm conversions.
+        self.settings: Dict[str, float] = {}
         self._plots: Dict[PlotIdLiteral, PlotRuntime] = {}
         self._status_poll_id: Optional[str] = None
         self._active_motor_plot: Optional[PlotIdLiteral] = None
@@ -203,6 +205,8 @@ class MeasurementsTab(ttk.Frame):
         self._steps_warned: set[str] = set()
 
         self._build_ui()
+        self._poll_status()
+        self.after(200, self.refresh_ports)
 
     # ------------------------------------------------------------------ #
     # Unit helpers
@@ -228,8 +232,6 @@ class MeasurementsTab(ttk.Frame):
             return float(value_mm) * self._steps_per_mm(axis)
         except Exception:
             return 0.0
-        self._poll_status()
-        self.after(200, self.refresh_ports)
 
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
@@ -469,8 +471,14 @@ class MeasurementsTab(ttk.Frame):
     def disconnect_motor(self) -> None:
         """Disconnect the motor controller and reset UI state."""
         self._logger.info("Disconnecting motor")
+        if self._active_motor_plot is not None:
+            self._stop_measurement(self._active_motor_plot)
+            self._active_motor_plot = None
+        try:
+            self._motor.stop()
+        except MotorError:
+            LOGGER.debug("Motor stop during disconnect raised error", exc_info=True)
         self._motor.disconnect()
-        self._active_motor_plot = None
         self._update_connection_buttons()
 
     def connect_daq(self) -> None:
