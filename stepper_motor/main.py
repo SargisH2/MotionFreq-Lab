@@ -6,10 +6,6 @@ import threading
 import time
 import re
 import logging
-import faulthandler
-import sys
-import queue
-from pathlib import Path
 from collections import deque
 from typing import Callable, Optional
 
@@ -86,35 +82,6 @@ class GRBLInterface:
         self._pending_hard_limits_last_attempt = 0.0
         self._suspend_hard_limits_enforcement = False
         self._persist_after_id: Optional[str] = None
-        self._config_save_lock = threading.Lock()
-        self._config_save_pending: Optional[MotorConfig] = None
-        self._config_save_event = threading.Event()
-        self._config_save_thread = threading.Thread(
-            target=self._config_save_worker,
-            name="MotorConfigSave",
-            daemon=True,
-        )
-        self._config_save_thread.start()
-        self._hard_limits_lock = threading.Lock()
-        self._hard_limits_inflight = False
-        self._ui_watchdog_last = time.monotonic()
-        self._ui_watchdog_threshold = 0.35
-        self._ui_watchdog_log = Path(__file__).resolve().with_name("ui_freeze.log")
-        self._trace_threshold = 0.25
-        self._freeze_dump_last = 0.0
-        self._freeze_dump_interval = 2.0
-        self._profile_last_call = None
-        self._profile_last_time = 0.0
-        self._install_profile_tracer()
-        self._bg_tk_call_seen: set[tuple[str, str, int]] = set()
-        self._install_thread_tk_tracer()
-        self._ui_actions: "queue.Queue[tuple]" = queue.Queue()
-        self._freeze_dump_thread = threading.Thread(
-            target=self._freeze_dump_worker,
-            name="UIFreezeDump",
-            daemon=True,
-        )
-        self._freeze_dump_thread.start()
 
         # cache for $$ parsing
         self.settings = {}
@@ -331,30 +298,7 @@ class GRBLInterface:
         self.master.after(40, self._flush_ui_log)
         # kick off periodic status polling for position display
         self.master.after(200, self._poll_status_and_update_ui)
-        self.master.after(120, self._ui_watchdog_tick)
         LOGGER.info("GRBLInterface initialised")
-
-    def _call_in_ui(self, func, *args, **kwargs):
-        if threading.current_thread() is threading.main_thread():
-            return func(*args, **kwargs)
-        try:
-            self._ui_actions.put((func, args, kwargs))
-        except Exception:
-            pass
-        return None
-
-    def _process_ui_actions(self, max_actions: int = 50) -> None:
-        processed = 0
-        while processed < max_actions:
-            try:
-                func, args, kwargs = self._ui_actions.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                func(*args, **kwargs)
-            except Exception:
-                pass
-            processed += 1
 
     # -------------------- Connection helpers --------------------
     def is_connected(self) -> bool:
@@ -398,130 +342,25 @@ class GRBLInterface:
         self.ui_log_queue.append(msg)
 
     def _flush_ui_log(self):
-        start = time.monotonic()
-        self._process_ui_actions()
         if self.ui_log_queue:
             self.log_area.config(state="normal")
-            max_lines = 200
-            lines = 0
-            while self.ui_log_queue and lines < max_lines:
+            while self.ui_log_queue:
                 self.log_area.insert(tk.END, self.ui_log_queue.popleft() + "\n")
-                lines += 1
             self.log_area.see(tk.END)
             self.log_area.config(state="disabled")
-        self._trace_duration("flush_ui_log", start)
         self.master.after(40, self._flush_ui_log)
-
-    def _ui_watchdog_tick(self) -> None:
-        now = time.monotonic()
-        delta = now - self._ui_watchdog_last
-        if delta > self._ui_watchdog_threshold:
-            try:
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                with self._ui_watchdog_log.open("a", encoding="utf-8") as fh:
-                    fh.write(f"{stamp} UI stall {delta:.3f}s\n")
-            except Exception:
-                pass
-            try:
-                self.ui_log_queue.append(f"⚠ UI stall {delta:.3f}s detected")
-            except Exception:
-                pass
-        self._ui_watchdog_last = now
-        try:
-            self.master.after(120, self._ui_watchdog_tick)
-        except Exception:
-            pass
-
-    def _freeze_dump_worker(self) -> None:
-        while True:
-            time.sleep(0.2)
-            stall = time.monotonic() - self._ui_watchdog_last
-            if stall < 1.0:
-                continue
-            now = time.monotonic()
-            if now - self._freeze_dump_last < self._freeze_dump_interval:
-                continue
-            self._freeze_dump_last = now
-            try:
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                with self._ui_watchdog_log.open("a", encoding="utf-8") as fh:
-                    fh.write(f"{stamp} TRACEBACK stall {stall:.3f}s\n")
-                    if self._profile_last_call is not None:
-                        age = time.monotonic() - self._profile_last_time
-                        fh.write(f"{stamp} LAST_PY_CALL {self._profile_last_call} age={age:.3f}s\n")
-                    faulthandler.dump_traceback(file=fh, all_threads=True)
-            except Exception:
-                pass
-
-    def _install_profile_tracer(self) -> None:
-        def tracer(frame, event, arg):
-            if event != "call":
-                return tracer
-            code = frame.f_code
-            filename = code.co_filename or ""
-            if "stepper_motor" not in filename and "tkinter" not in filename:
-                return tracer
-            self._profile_last_call = f"{Path(filename).name}:{code.co_name}:{frame.f_lineno}"
-            self._profile_last_time = time.monotonic()
-            return tracer
-
-        try:
-            sys.setprofile(tracer)
-        except Exception:
-            pass
-
-    def _install_thread_tk_tracer(self) -> None:
-        def tracer(frame, event, arg):
-            if event != "call":
-                return tracer
-            if threading.current_thread() is threading.main_thread():
-                return tracer
-            code = frame.f_code
-            filename = code.co_filename or ""
-            if "tkinter" not in filename:
-                return tracer
-            key = (threading.current_thread().name, code.co_name, code.co_firstlineno)
-            if key in self._bg_tk_call_seen:
-                return tracer
-            self._bg_tk_call_seen.add(key)
-            try:
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                with self._ui_watchdog_log.open("a", encoding="utf-8") as fh:
-                    fh.write(f"{stamp} BG_TK_CALL {key}\n")
-            except Exception:
-                pass
-            return tracer
-
-        try:
-            threading.setprofile(tracer)
-        except Exception:
-            pass
-
-    def _trace_duration(self, label: str, start: float) -> None:
-        elapsed = time.monotonic() - start
-        if elapsed < self._trace_threshold:
-            return
-        try:
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            with self._ui_watchdog_log.open("a", encoding="utf-8") as fh:
-                fh.write(f"{stamp} TRACE {label} {elapsed:.3f}s\n")
-        except Exception:
-            pass
 
     def clear_logs(self):
         try:
             self.ui_log_queue.clear()
         except Exception:
             pass
-        self._call_in_ui(self._clear_logs_ui)
-
-    def _clear_logs_ui(self):
         self.log_area.config(state="normal")
         self.log_area.delete("1.0", tk.END)
         self.log_area.config(state="disabled")
 
     def set_state(self, txt):
-        self._call_in_ui(self.machine_state.set, txt)
+        self.machine_state.set(txt)
 
     # -------------------- Serial I/O --------------------
     def connect(self):
@@ -547,7 +386,7 @@ class GRBLInterface:
                 self.log(f"Connected to GRBL on {port} @ {baud}")
                 self.wait_for_startup(timeout=4.0)
                 self._pending_hard_limits_enable = True
-                self.master.after(250, self._schedule_hard_limits_check)
+                self.master.after(250, self._maybe_enable_hard_limits)
                 self._update_port_defaults(port, baud)
             except MotorError as exc:
                 messagebox.showerror("Connection error", str(exc))
@@ -565,7 +404,7 @@ class GRBLInterface:
             self.set_state(f"Connected {port}@{baud}")
             self.log(f"Connected to GRBL on {port} @ {baud}")
             self._pending_hard_limits_enable = True
-            self.master.after(250, self._schedule_hard_limits_check)
+            self.master.after(250, self._maybe_enable_hard_limits)
             self._update_port_defaults(port, baud)
         except Exception as e:
             messagebox.showerror("Connection error", str(e))
@@ -722,26 +561,13 @@ class GRBLInterface:
         return cfg
 
     def _persist_motor_config(self) -> None:
-        cfg = self._capture_ui_into_config(self._motor_config)
-        self._motor_config = cfg
-        with self._config_save_lock:
-            self._config_save_pending = cfg
-        self._config_save_event.set()
-
-    def _config_save_worker(self) -> None:
-        while True:
-            self._config_save_event.wait()
-            self._config_save_event.clear()
-            while True:
-                with self._config_save_lock:
-                    pending = self._config_save_pending
-                    self._config_save_pending = None
-                if pending is None:
-                    break
-                try:
-                    save_motor_config(pending)
-                except Exception:
-                    LOGGER.exception("Failed to save motor config", exc_info=True)
+        cfg = self._capture_ui_into_config(load_motor_config())
+        try:
+            save_motor_config(cfg)
+        except Exception:
+            LOGGER.exception("Failed to save motor config", exc_info=True)
+        else:
+            self._motor_config = cfg
 
     def _schedule_persist_motor_config(self, delay_ms: int = 250) -> None:
         """Debounce config writes while the user is editing fields."""
@@ -765,7 +591,7 @@ class GRBLInterface:
 
         label = self.span_x if axis.upper() == "X" else self.span_y
         try:
-            self._call_in_ui(label.set, f"{span:.3f}")
+            label.set(f"{span:.3f}")
         except Exception:
             pass
 
@@ -907,21 +733,6 @@ class GRBLInterface:
             time.sleep(0.05)
         return False
 
-    def _schedule_hard_limits_check(self, *, force: bool = False) -> None:
-        with self._hard_limits_lock:
-            if self._hard_limits_inflight:
-                return
-            self._hard_limits_inflight = True
-
-        def worker() -> None:
-            try:
-                self._maybe_enable_hard_limits(force=force)
-            finally:
-                with self._hard_limits_lock:
-                    self._hard_limits_inflight = False
-
-        threading.Thread(target=worker, name="HardLimitsEnforce", daemon=True).start()
-
     def _maybe_enable_hard_limits(self, *, force: bool = False) -> None:
         """Ensure GRBL hard limits are enabled ($21=1), with throttled retries."""
         backend = self._motor_backend()
@@ -1045,18 +856,17 @@ class GRBLInterface:
             self.home_y_mpos = value
         self.last_home_mpos[ax] = value
 
-    def _go_home(self, axis: str, *, base_feed: float | None = None):
+    def _go_home(self, axis: str):
         ax = axis.upper()
         if not self.is_connected():
             self.log("❌ Not connected")
             return
         backend = self._motor_backend()
         if backend is not None:
-            if base_feed is None:
-                try:
-                    base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
-                except Exception:
-                    base_feed = 1600.0
+            try:
+                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
+            except Exception:
+                base_feed = 1600.0
             gentle = min(1600.0, max(60.0, base_feed))
             try:
                 current = backend.get_position(ax)
@@ -1076,11 +886,10 @@ class GRBLInterface:
             return
         home_target = self._get_home_target(ax)
         if home_target is None:
-            if base_feed is None:
-                try:
-                    base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
-                except Exception:
-                    base_feed = 1600.0
+            try:
+                base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
+            except Exception:
+                base_feed = 1600.0
             gentle = min(1600.0, max(60.0, base_feed))
             if not self.safe_send("G90"):
                 return
@@ -1321,7 +1130,6 @@ class GRBLInterface:
         return False
 
     def _poll_status_and_update_ui(self):
-        start = time.monotonic()
         try:
             backend = self._motor_backend()
             if backend is not None:
@@ -1360,10 +1168,9 @@ class GRBLInterface:
                     self.wpos_x.set(f"{wpos[0]:.3f}")
                     self.wpos_y.set(f"{wpos[1]:.3f}")
             # Safety: if we disabled hard limits temporarily, retry enabling them in the background.
-            self._schedule_hard_limits_check()
+            self._maybe_enable_hard_limits()
         except Exception:
             pass
-        self._trace_duration("poll_status", start)
         # Reschedule
         try:
             self.master.after(250, self._poll_status_and_update_ui)
@@ -1689,7 +1496,7 @@ class GRBLInterface:
                 else:
                     self._pending_hard_limits_enable = True
                     try:
-                        self.master.after(400, self._schedule_hard_limits_check)
+                        self.master.after(400, self._maybe_enable_hard_limits)
                     except Exception:
                         pass
 
@@ -1777,44 +1584,13 @@ class GRBLInterface:
 
     # -------------------- Homing sequences --------------------
     def start_home_x(self):
-        params = self._read_home_params()
-        threading.Thread(target=self._home_sequence, args=(True, False, *params), daemon=True).start()
+        threading.Thread(target=self._home_sequence, args=(True, False), daemon=True).start()
 
     def start_home_y(self):
-        params = self._read_home_params()
-        threading.Thread(target=self._home_sequence, args=(False, True, *params), daemon=True).start()
+        threading.Thread(target=self._home_sequence, args=(False, True), daemon=True).start()
 
     def start_home_xy(self):
-        params = self._read_home_params()
-        threading.Thread(target=self._home_sequence, args=(True, True, *params), daemon=True).start()
-
-    def _read_home_params(self) -> tuple[float, float, float, bool, bool, float]:
-        try:
-            feed = float(self.feed_entry.get() or "1600")
-        except Exception:
-            feed = 1600.0
-        try:
-            clear_mm = float(self.clear_entry.get() or "3")
-        except Exception:
-            clear_mm = 3.0
-        try:
-            long_mm = float(self.long_entry.get() or "1000")
-        except Exception:
-            long_mm = 1000.0
-        try:
-            x_enabled = bool(self.x_en.get())
-        except Exception:
-            x_enabled = True
-        try:
-            y_enabled = bool(self.y_en.get())
-        except Exception:
-            y_enabled = True
-        try:
-            base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
-        except Exception:
-            base_feed = 1600.0
-        return_feed = min(1600.0, max(60.0, base_feed))
-        return feed, clear_mm, long_mm, x_enabled, y_enabled, return_feed
+        threading.Thread(target=self._home_sequence, args=(True, True), daemon=True).start()
 
     def request_stop(self):
         backend = self._motor_backend()
@@ -1848,22 +1624,16 @@ class GRBLInterface:
         self.safe_send("G91")
         self.wait_for_ok_or_idle(0.5)
 
-    def _home_sequence(
-        self,
-        do_x: bool,
-        do_y: bool,
-        feed: float,
-        clear_mm: float,
-        long_mm: float,
-        x_enabled: bool,
-        y_enabled: bool,
-        return_feed: float,
-    ):
+    def _home_sequence(self, do_x: bool, do_y: bool):
         if not self.is_connected():
             self.log("❌ Not connected")
             return
         homed_ok = True
         try:
+            feed = float(self.feed_entry.get() or "1600")
+            clear_mm = float(self.clear_entry.get() or "3")
+            long_mm = float(self.long_entry.get() or "1000")
+
             if not do_x and not do_y:
                 self.log("Nothing to home (no axes selected)")
                 return
@@ -1880,18 +1650,18 @@ class GRBLInterface:
             self.safe_send("$X")
             self.wait_for_ok_or_idle(1.0)
 
-            if do_x and x_enabled:
+            if do_x and self.x_en.get():
                 homed_ok &= self._home_one_axis_release("X", long_mm, feed, clear_mm)
-                if homed_ok and do_y and y_enabled:
+                if homed_ok and do_y and self.y_en.get():
                     # Return X to its captured home before starting Y
                     try:
                         self.log("↩ Moving X back to home before starting Y homing")
-                        self._go_home("X", base_feed=return_feed)
+                        self.go_x_home()
                     except Exception as exc:
                         self.log(f"⚠ Failed to return X to home before Y: {exc}")
                         homed_ok = False
 
-            if do_y and y_enabled:
+            if do_y and self.y_en.get():
                 homed_ok &= self._home_one_axis_release("Y", long_mm, feed, clear_mm)
 
             if homed_ok and self.is_connected():
