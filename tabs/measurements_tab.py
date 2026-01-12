@@ -39,12 +39,12 @@ logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
 # Sampling cadence for acquisition workers (seconds).
 SAMPLING_INTERVAL = max(MIN_SAMPLE_INTERVAL, 0.01)
-# Minimum delay after each motor step before requesting the next sample (s)
-MOTOR_SETTLE_INTERVAL = 0.1
-# Delay between jog retry attempts when GRBL queue reports error:9 (s)
-JOG_RETRY_DELAY = 0.15
-# Maximum number of times to retry a jog command after recoverable failures
-MAX_JOG_RETRIES = 2
+# Timeout for GRBL status requests (seconds).
+STATUS_QUERY_TIMEOUT = 0.2
+# Poll cadence when waiting on sweep positioning (seconds).
+SWEEP_POLL_INTERVAL = 0.05
+# Position tolerance for sweep start/end checks (mm).
+SWEEP_POSITION_TOLERANCE = 0.01
 
 MODE_LABELS: Dict[ModeLiteral, str] = {
     "no_motor_time": "No Motor (Time)",
@@ -75,11 +75,15 @@ class PlotRuntime:
     start_monotonic: float = 0.0
     start_time: Optional[datetime] = None
     freq_iter: Optional[Iterator[Tuple[float, float]]] = None
-    last_move_duration: float = 0.0
-    last_jog_command_time: float = 0.0
     last_measurement_finished_at: float = 0.0
     next_measurement_not_before: float = 0.0
     last_coordinate_mm: float = 0.0
+    sweep_started_event: Optional[threading.Event] = None
+    sweep_start_mm: float = 0.0
+    sweep_end_mm: float = 0.0
+    coord_system: str = "work"
+    stop_motor_on_stop: bool = True
+    stop_reason: Optional[str] = None
 
 
 class PlotCard(ttk.LabelFrame):
@@ -233,7 +237,6 @@ class MeasurementsTab(ttk.Frame):
         if not axis_choices:
             axis_choices = list(AXES)
         axis_default = cfg.default_axis if cfg.default_axis in axis_choices else axis_choices[0]
-        step_default = max(0.001, float(getattr(cfg, "jog_step", 1.0) or 1.0))
 
         ttk.Label(top, text="Motor Feed (mm/min):").grid(row=0, column=0, sticky="w")
         self.speed_var = tk.DoubleVar(value=max(1.0, speed_default))
@@ -251,46 +254,30 @@ class MeasurementsTab(ttk.Frame):
         self.speed_spin.bind("<FocusOut>", lambda _: self._on_speed_changed())
         self.speed_spin.bind("<Return>", lambda _: self._on_speed_changed())
 
-        ttk.Label(top, text="Step (mm):").grid(row=0, column=2, sticky="w")
-        self.step_var = tk.DoubleVar(value=step_default)
-        self.step_spin = ttk.Spinbox(
-            top,
-            from_=0.001,
-            to=100.0,
-            increment=0.001,
-            textvariable=self.step_var,
-            width=7,
-            format="%.2f",
-        )
-        self.step_spin.grid(row=0, column=3, padx=(4, 12))
-        self.step_spin.configure(command=self._on_step_changed)
-        self.step_spin.bind("<FocusOut>", lambda _: self._on_step_changed())
-        self.step_spin.bind("<Return>", lambda _: self._on_step_changed())
-
-        ttk.Label(top, text="Axis:").grid(row=0, column=4, sticky="w")
+        ttk.Label(top, text="Axis:").grid(row=0, column=2, sticky="w")
         self.axis_var = tk.StringVar(value=axis_default)
         self.axis_combo = ttk.Combobox(top, values=axis_choices, textvariable=self.axis_var, state="readonly", width=3)
-        self.axis_combo.grid(row=0, column=5, padx=(4, 12))
+        self.axis_combo.grid(row=0, column=3, padx=(4, 12))
 
-        ttk.Label(top, text="Port:").grid(row=0, column=6, sticky="w")
+        ttk.Label(top, text="Port:").grid(row=0, column=4, sticky="w")
         self.port_var = tk.StringVar(value=cfg.default_port)
         self.port_combo = ttk.Combobox(top, textvariable=self.port_var, state="readonly", width=14)
-        self.port_combo.grid(row=0, column=7, padx=(4, 8))
+        self.port_combo.grid(row=0, column=5, padx=(4, 8))
 
         self.refresh_btn = ttk.Button(top, text="Refresh", command=self.refresh_ports)
-        self.refresh_btn.grid(row=0, column=8, padx=(0, 8))
+        self.refresh_btn.grid(row=0, column=6, padx=(0, 8))
 
         self.connect_btn = ttk.Button(top, text="Connect", command=self.connect_motor)
-        self.connect_btn.grid(row=0, column=9, padx=(0, 4))
+        self.connect_btn.grid(row=0, column=7, padx=(0, 4))
 
         self.disconnect_btn = ttk.Button(top, text="Disconnect", command=self.disconnect_motor)
-        self.disconnect_btn.grid(row=0, column=10, padx=(0, 4))
+        self.disconnect_btn.grid(row=0, column=8, padx=(0, 4))
 
         self.home_btn = ttk.Button(top, text="Home to Zero", command=self.home_motor)
-        self.home_btn.grid(row=0, column=11, padx=(8, 4))
+        self.home_btn.grid(row=0, column=9, padx=(8, 4))
 
         self.stop_btn = ttk.Button(top, text="Stop Motor", command=self.stop_motor)
-        self.stop_btn.grid(row=0, column=12, padx=(4, 0))
+        self.stop_btn.grid(row=0, column=10, padx=(4, 0))
 
         ttk.Label(top, text="DAQ Port:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.daq_port_var = tk.StringVar()
@@ -358,6 +345,29 @@ class MeasurementsTab(ttk.Frame):
             state=tk.DISABLED,
         )
         self.daq_disconnect_btn.grid(row=1, column=18, padx=(0, 4), pady=(4, 0))
+
+        ttk.Label(top, text="Start (mm):").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.start_pos_var = tk.StringVar(value="0.0")
+        ttk.Entry(top, textvariable=self.start_pos_var, width=8).grid(row=2, column=1, padx=(4, 8), pady=(4, 0))
+
+        ttk.Label(top, text="End (mm):").grid(row=2, column=2, sticky="w", pady=(4, 0))
+        self.end_pos_var = tk.StringVar(value="10.0")
+        ttk.Entry(top, textvariable=self.end_pos_var, width=8).grid(row=2, column=3, padx=(4, 8), pady=(4, 0))
+
+        ttk.Label(top, text="Accel (mm/s^2):").grid(row=2, column=4, sticky="w", pady=(4, 0))
+        self.accel_var = tk.StringVar(value="100.0")
+        ttk.Entry(top, textvariable=self.accel_var, width=8).grid(row=2, column=5, padx=(4, 8), pady=(4, 0))
+
+        ttk.Label(top, text="Coord:").grid(row=2, column=6, sticky="w", pady=(4, 0))
+        self.coord_var = tk.StringVar(value="WPos")
+        self.coord_combo = ttk.Combobox(
+            top,
+            values=("WPos", "MPos"),
+            textvariable=self.coord_var,
+            state="readonly",
+            width=5,
+        )
+        self.coord_combo.grid(row=2, column=7, padx=(4, 8), pady=(4, 0))
 
         mode, k_val = self._daq.measurement_configuration
         self.daq_mode_var.set(mode)
@@ -460,8 +470,6 @@ class MeasurementsTab(ttk.Frame):
             self.axis_var.set(axis_choices[0])
         feed = float(getattr(cfg, "jog_feed", 1600.0) or 1600.0)
         self.speed_var.set(max(1.0, feed))
-        step = float(getattr(cfg, "jog_step", 1.0) or 1.0)
-        self.step_var.set(max(0.001, step))
 
     def connect_motor(self) -> None:
         """Connect the shared motor controller using the selected port."""
@@ -586,76 +594,6 @@ class MeasurementsTab(ttk.Frame):
         var.set(f"{value}")
         return value
 
-    def _sanitize_step_value(self) -> float:
-        """Ensure the jog distance is a positive float."""
-        try:
-            value = float(self.step_var.get())
-        except (tk.TclError, ValueError):
-            value = float(getattr(self._motor_config, "jog_step", 1.0) or 1.0)
-        return max(0.001, value)
-
-    def _on_step_changed(self) -> None:
-        """Clamp the jog step value and persist it for future sessions."""
-        sanitized = self._sanitize_step_value()
-        try:
-            current = float(self.step_var.get())
-        except (tk.TclError, ValueError):
-            current = sanitized
-        if abs(current - sanitized) > 1e-6:
-            self.step_var.set(sanitized)
-        self._persist_motor_config()
-
-    def _wait_for_motor_ready(self, runtime: PlotRuntime, stop_event: threading.Event) -> bool:
-        """Block until the previous jog plus settle time has elapsed."""
-        expected_done = runtime.last_jog_command_time + runtime.last_move_duration + MOTOR_SETTLE_INTERVAL
-        now = time.perf_counter()
-        if expected_done > now:
-            delay = expected_done - now
-            if stop_event.wait(delay):
-                return False
-        if not self._motor.is_simulation:
-            snapshot = self._motor.snapshot()
-            if snapshot.moving or snapshot.direction != 0:
-                self._logger.debug("Motor still moving; issuing jog cancel before next command")
-                try:
-                    cancel = getattr(self._motor, "send_raw", None)
-                    if callable(cancel):
-                        cancel(b"\x85")
-                        time.sleep(0.05)
-                except MotorError:
-                    self._logger.warning("Jog cancel before move failed", exc_info=True)
-        return True
-
-    def _jog_with_retry(
-        self,
-        axis: str,
-        delta: float,
-        speed: float,
-        stop_event: threading.Event,
-    ) -> bool:
-        """Attempt a jog, retrying after recoverable GRBL errors."""
-
-        attempts = 0
-        while attempts <= MAX_JOG_RETRIES and not stop_event.is_set():
-            try:
-                self._motor.jog_increment(axis, delta, float(speed))
-                return True
-            except MotorError as exc:
-                message = str(exc).lower()
-                if "error:9" in message and attempts < MAX_JOG_RETRIES and not stop_event.is_set():
-                    attempts += 1
-                    self._logger.warning(
-                        "Jog command rejected by GRBL (error:9). Retrying in %.2fs (attempt %d/%d)",
-                        JOG_RETRY_DELAY,
-                        attempts,
-                        MAX_JOG_RETRIES,
-                    )
-                    self._motor.stop()
-                    stop_event.wait(JOG_RETRY_DELAY)
-                    continue
-                raise
-        return False
-
     def _capture_motor_config(self, cfg: MotorConfig) -> MotorConfig:
         """Copy the current UI values into a MotorConfig instance."""
         cfg.jog_feed = self._sanitize_speed_value()
@@ -674,7 +612,6 @@ class MeasurementsTab(ttk.Frame):
         if port.lower().startswith("simulated"):
             port = SIMULATED_PORT_NAME
         cfg.default_port = port
-        cfg.jog_step = self._sanitize_step_value()
         return cfg
 
     def _persist_motor_config(self) -> None:
@@ -848,45 +785,63 @@ class MeasurementsTab(ttk.Frame):
                 )
                 return
 
+        axis = (self.axis_var.get() or "").upper()
+        if axis not in AXES:
+            axis = AXES[0]
+        speed = self._sanitize_speed_value()
+        start_mm = 0.0
+        end_mm = 0.0
+        accel = 0.0
+        coord_system = "work"
+        if mode != "no_motor_time":
+            start_mm, end_mm, accel, coord_system = self._read_sweep_settings()
+            if mode == "pos_from_zero" and end_mm < start_mm:
+                messagebox.showwarning(
+                    "Invalid sweep range",
+                    "End position must be greater than or equal to start for + direction.",
+                )
+                return
+            if mode == "neg_from_zero" and end_mm > start_mm:
+                messagebox.showwarning(
+                    "Invalid sweep range",
+                    "End position must be less than or equal to start for - direction.",
+                )
+                return
+
         runtime = self._plots[plot_id]
         runtime.buffer.clear()
         runtime.card.reset_plot(mode)
         runtime.card.set_running(mode)
         runtime.mode = mode
         runtime.stop_event = threading.Event()
+        runtime.sweep_started_event = threading.Event() if mode != "no_motor_time" else None
+        runtime.stop_motor_on_stop = True
+        runtime.stop_reason = None
         now = time.perf_counter()
         runtime.start_monotonic = now
         runtime.start_time = datetime.now()
-        runtime.last_move_duration = 0.0
-        runtime.last_jog_command_time = now
         runtime.last_measurement_finished_at = now
         runtime.next_measurement_not_before = now
-        runtime.last_coordinate_mm = 0.0
+        runtime.last_coordinate_mm = start_mm if mode != "no_motor_time" else 0.0
+        runtime.sweep_start_mm = start_mm
+        runtime.sweep_end_mm = end_mm
+        runtime.coord_system = coord_system
         runtime.motor_thread = None
-
-        if mode != "no_motor_time" and self._motor.is_connected():
-            try:
-                runtime.last_coordinate_mm = float(self._motor.get_position(axis))
-            except Exception:
-                pass
-
-        step_distance = self._sanitize_step_value()
 
         thread = threading.Thread(
             target=self._acquisition_loop,
             name=f"Acquisition-{plot_id}",
-            args=(runtime, axis, mode, step_distance),
+            args=(runtime, axis, mode),
             daemon=True,
         )
         runtime.thread = thread
         thread.start()
 
         if mode in {"pos_from_zero", "neg_from_zero"}:
-            direction = +1 if mode == "pos_from_zero" else -1
             motor_thread = threading.Thread(
-                target=self._motor_loop,
-                name=f"MotorLoop-{plot_id}",
-                args=(runtime, axis, direction, step_distance),
+                target=self._motor_sweep,
+                name=f"MotorSweep-{plot_id}",
+                args=(runtime, axis, start_mm, end_mm, speed, accel, coord_system),
                 daemon=True,
             )
             runtime.motor_thread = motor_thread
@@ -896,6 +851,193 @@ class MeasurementsTab(ttk.Frame):
             self._active_motor_plot = plot_id
         if not self._daq.is_simulation:
             self._active_daq_plot = plot_id
+
+    def _coord_system(self) -> str:
+        value = (self.coord_var.get() or "WPos").strip().upper()
+        return "machine" if value.startswith("M") else "work"
+
+    def _read_sweep_settings(self) -> Tuple[float, float, float, str]:
+        start_mm = self._get_entry_float(self.start_pos_var, 0.0)
+        end_mm = self._get_entry_float(self.end_pos_var, 0.0)
+        accel = self._get_entry_float(self.accel_var, 0.0, min_value=0.0)
+        coord_system = self._coord_system()
+        return start_mm, end_mm, accel, coord_system
+
+    def _wait_for_sweep_start(self, runtime: PlotRuntime, stop_event: threading.Event) -> bool:
+        event = runtime.sweep_started_event
+        if event is None:
+            return True
+        while not stop_event.is_set():
+            if event.wait(SWEEP_POLL_INTERVAL):
+                return True
+        return False
+
+    def _read_axis_position(self, axis: str, coord_system: str) -> Optional[float]:
+        use_machine = coord_system == "machine"
+        try:
+            return self._motor.read_status_position(axis, use_machine=use_machine, timeout=STATUS_QUERY_TIMEOUT)
+        except MotorError:
+            return None
+
+    def _has_reached_end(self, runtime: PlotRuntime, coordinate_mm: float) -> bool:
+        start_mm = runtime.sweep_start_mm
+        end_mm = runtime.sweep_end_mm
+        if end_mm >= start_mm:
+            return coordinate_mm >= (end_mm - SWEEP_POSITION_TOLERANCE)
+        return coordinate_mm <= (end_mm + SWEEP_POSITION_TOLERANCE)
+
+    def _build_move_command(self, axis: str, target_mm: float, speed: float, coord_system: str) -> str:
+        prefix = "G53 " if coord_system == "machine" else ""
+        return f"{prefix}G1 {axis}{target_mm:.3f} F{speed:.1f}"
+
+    def _apply_axis_settings(self, axis: str, *, speed: float, accel: float) -> None:
+        axis = axis.upper()
+        speed_setting = {"X": "$110", "Y": "$111"}.get(axis)
+        accel_setting = {"X": "$120", "Y": "$121"}.get(axis)
+        if accel_setting and accel > 0:
+            self._motor.send_line(f"{accel_setting}={accel:.3f}")
+        if speed_setting:
+            self._motor.send_line(f"{speed_setting}={speed:.1f}")
+
+    def _estimate_move_timeout(self, current: float, target: float, speed: float) -> float:
+        if speed <= 0:
+            return 5.0
+        distance = abs(target - current)
+        seconds = distance / (speed / 60.0) if speed > 0 else 0.0
+        return max(2.0, min(120.0, seconds * 2.0 + 2.0))
+
+    def _wait_for_target_position(
+        self,
+        runtime: PlotRuntime,
+        axis: str,
+        target_mm: float,
+        coord_system: str,
+        speed: float,
+        stop_event: threading.Event,
+    ) -> bool:
+        current = self._read_axis_position(axis, coord_system)
+        if current is None:
+            for _ in range(3):
+                if stop_event.wait(SWEEP_POLL_INTERVAL):
+                    return False
+                current = self._read_axis_position(axis, coord_system)
+                if current is not None:
+                    break
+        if current is None:
+            self._logger.warning("Status position unavailable; skipping start confirmation")
+            return True
+        timeout = self._estimate_move_timeout(current, target_mm, speed)
+        deadline = time.monotonic() + timeout
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            pos = self._read_axis_position(axis, coord_system)
+            if pos is not None:
+                runtime.last_coordinate_mm = pos
+                if abs(pos - target_mm) <= SWEEP_POSITION_TOLERANCE:
+                    return True
+            stop_event.wait(SWEEP_POLL_INTERVAL)
+        return False
+
+    def _simulate_axis_move(
+        self,
+        axis: str,
+        start_mm: float,
+        end_mm: float,
+        speed: float,
+        stop_event: threading.Event,
+    ) -> bool:
+        delta = end_mm - start_mm
+        if abs(delta) <= SWEEP_POSITION_TOLERANCE:
+            self._motor.set_position(axis, end_mm)
+            return True
+        mm_per_sec = max(speed, 1.0) / 60.0
+        duration = abs(delta) / mm_per_sec if mm_per_sec > 0 else 0.0
+        tick = max(SWEEP_POLL_INTERVAL, 0.02)
+        steps = max(1, int(duration / tick))
+        for idx in range(steps):
+            if stop_event.is_set():
+                return False
+            frac = (idx + 1) / steps
+            pos = start_mm + (delta * frac)
+            self._motor.set_position(axis, pos)
+            stop_event.wait(tick)
+        self._motor.set_position(axis, end_mm)
+        return True
+
+    def _motor_sweep(
+        self,
+        runtime: PlotRuntime,
+        axis: str,
+        start_mm: float,
+        end_mm: float,
+        speed: float,
+        accel: float,
+        coord_system: str,
+    ) -> None:
+        stop_event = runtime.stop_event
+        if stop_event is None:
+            return
+        if not self._motor.is_connected():
+            stop_event.set()
+            return
+        try:
+            self._apply_axis_settings(axis, speed=speed, accel=accel)
+        except MotorError as exc:
+            self._report_error(f"Failed to apply axis settings: {exc}")
+            stop_event.set()
+            return
+
+        if self._motor.is_simulation:
+            current = runtime.last_coordinate_mm
+            if not self._simulate_axis_move(axis, current, start_mm, speed, stop_event):
+                return
+            runtime.last_coordinate_mm = start_mm
+            if stop_event.is_set():
+                return
+            runtime.start_monotonic = time.perf_counter()
+            runtime.start_time = datetime.now()
+            runtime.last_measurement_finished_at = time.perf_counter()
+            if runtime.sweep_started_event:
+                runtime.sweep_started_event.set()
+            if not self._simulate_axis_move(axis, start_mm, end_mm, speed, stop_event):
+                return
+            return
+
+        try:
+            self._motor.send_line("G21")
+            self._motor.send_line("G90")
+        except MotorError as exc:
+            self._report_error(f"Failed to set motion mode: {exc}")
+            stop_event.set()
+            return
+
+        try:
+            self._motor.send_line(self._build_move_command(axis, start_mm, speed, coord_system))
+        except MotorError as exc:
+            self._report_error(f"Failed to move to start: {exc}")
+            stop_event.set()
+            return
+
+        if not self._wait_for_target_position(runtime, axis, start_mm, coord_system, speed, stop_event):
+            if not stop_event.is_set():
+                self._report_error("Timed out waiting for start position.")
+            stop_event.set()
+            return
+
+        if stop_event.is_set():
+            return
+
+        try:
+            self._motor.send_line(self._build_move_command(axis, end_mm, speed, coord_system))
+        except MotorError as exc:
+            self._report_error(f"Failed to start sweep: {exc}")
+            stop_event.set()
+            return
+
+        runtime.start_monotonic = time.perf_counter()
+        runtime.start_time = datetime.now()
+        runtime.last_measurement_finished_at = time.perf_counter()
+        if runtime.sweep_started_event:
+            runtime.sweep_started_event.set()
 
     def _stop_measurement(self, plot_id: PlotIdLiteral, *, from_thread: bool = False) -> None:
         """Stop acquisition for a plot and reset its UI state."""
@@ -920,7 +1062,8 @@ class MeasurementsTab(ttk.Frame):
         motor_thread = runtime.motor_thread
         if motor_thread and motor_thread.is_alive() and not from_thread:
             motor_thread.join(timeout=2.0)
-        if previous_mode in {"pos_from_zero", "neg_from_zero"} and self._motor.is_connected():
+        stop_motor = runtime.stop_motor_on_stop
+        if previous_mode in {"pos_from_zero", "neg_from_zero"} and self._motor.is_connected() and stop_motor:
             try:
                 self._logger.debug("Issuing realtime jog cancel")
                 cancel = getattr(self._motor, "send_raw", None)
@@ -935,6 +1078,9 @@ class MeasurementsTab(ttk.Frame):
         runtime.thread = None
         runtime.motor_thread = None
         runtime.stop_event = None
+        runtime.sweep_started_event = None
+        runtime.stop_motor_on_stop = True
+        runtime.stop_reason = None
         runtime.mode = None
         runtime.card.set_running(None)
         if self._active_motor_plot == plot_id:
@@ -947,18 +1093,20 @@ class MeasurementsTab(ttk.Frame):
         runtime: PlotRuntime,
         axis: str,
         mode: ModeLiteral,
-        step_distance: float,
     ) -> None:
         """Background loop that streams data and updates the UI."""
         stop_event = runtime.stop_event
         if stop_event is None:
             return
-        step_distance = max(0.001, float(step_distance or 0.0))
         freq_iter: Optional[Iterator[Tuple[float, float]]] = None
         use_iter = mode == "no_motor_time"
         try:
             interval = max(0.0, self._daq_interval_sec)
             auto_trigger = bool(self._daq_auto_trigger)
+            if mode != "no_motor_time":
+                if not self._wait_for_sweep_start(runtime, stop_event):
+                    return
+                runtime.last_measurement_finished_at = time.perf_counter()
             def _read_single() -> Optional[Tuple[float, float]]:
                 measurement_interval = interval
                 if self._daq.is_simulation:
@@ -1009,14 +1157,12 @@ class MeasurementsTab(ttk.Frame):
                     if stop_event.is_set():
                         break
                     timestamp = datetime.now()
+                    coordinate_mm = runtime.last_coordinate_mm
                     if mode != "no_motor_time" and self._motor.is_connected():
-                        try:
-                            coordinate_mm = self._motor.get_position(axis)
-                            runtime.last_coordinate_mm = float(coordinate_mm)
-                        except MotorError:
-                            coordinate_mm = runtime.last_coordinate_mm
-                    else:
-                        coordinate_mm = runtime.last_coordinate_mm
+                        pos = self._read_axis_position(axis, runtime.coord_system)
+                        if pos is not None:
+                            coordinate_mm = pos
+                            runtime.last_coordinate_mm = pos
 
                     elapsed = time.perf_counter() - runtime.start_monotonic
                     if mode == "no_motor_time":
@@ -1026,6 +1172,11 @@ class MeasurementsTab(ttk.Frame):
                         coordinate = self._mm_to_mm(coordinate_mm)
                         x_value = coordinate
                     self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate, x_value, elapsed, timestamp)
+                    if mode != "no_motor_time" and self._has_reached_end(runtime, coordinate_mm):
+                        runtime.stop_reason = "end_reached"
+                        runtime.stop_motor_on_stop = False
+                        stop_event.set()
+                        break
         except MotorError as exc:
             # Motor errors should not prevent DAQ-only capture.
             self._logger.warning("Motor error during acquisition; continuing: %s", exc)
@@ -1036,51 +1187,9 @@ class MeasurementsTab(ttk.Frame):
                 except Exception:
                     pass
             runtime.freq_iter = None
-            if mode != "no_motor_time":
+            if mode != "no_motor_time" and runtime.stop_motor_on_stop:
                 self._motor.stop()
             self.after(0, lambda pid=runtime.plot_id: self._stop_measurement(pid, from_thread=True))
-
-    def _motor_loop(self, runtime: PlotRuntime, axis: str, direction: int, step_distance: float) -> None:
-        """Background loop that advances the motor independently of DAQ sampling."""
-        stop_event = runtime.stop_event
-        if stop_event is None:
-            return
-        if not self._motor.is_connected():
-            return
-        if direction not in (-1, +1):
-            return
-        step_distance = max(0.001, float(step_distance or 0.0))
-        speed = max(1.0, self._sanitize_speed_value())
-        try:
-            try:
-                self._logger.debug("Homing axis %s before sweep (dir=%s)", axis, direction)
-                self._motor.home(axis)
-                runtime.last_coordinate_mm = 0.0
-                time.sleep(MOTOR_SETTLE_INTERVAL)
-            except MotorError as exc:
-                self._logger.warning("Motor home failed; motor thread exiting: %s", exc)
-                return
-
-            while not stop_event.is_set():
-                try:
-                    runtime.last_jog_command_time = time.perf_counter()
-                    self._motor.jog_increment(axis, direction * step_distance, speed)
-                    runtime.last_move_duration = max(0.0, time.perf_counter() - runtime.last_jog_command_time)
-                except MotorError as exc:
-                    self._logger.warning("Motor jog failed; motor thread exiting: %s", exc)
-                    try:
-                        self._motor.stop()
-                    except Exception:
-                        pass
-                    return
-                # Small pause to avoid hammering the controller with back-to-back jogs.
-                if stop_event.wait(MOTOR_SETTLE_INTERVAL):
-                    break
-        finally:
-            try:
-                self._motor.stop()
-            except Exception:
-                pass
 
     def _record_measurement(
         self,

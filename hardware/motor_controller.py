@@ -53,6 +53,7 @@ class MotorController:
         self._movement_axis: Optional[str] = None
         self._movement_direction = 0
         self._movement_speed = 0.0
+        self._status_query_lock = threading.Lock()
         self._last_error: Optional[str] = None
         self._default_feed = max(1.0, float(default_feed))
 
@@ -334,6 +335,40 @@ class MotorController:
             last_error=last_error,
         )
 
+    def read_status_positions(
+        self,
+        *,
+        timeout: float = 0.2,
+    ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
+        """Query GRBL status and return (MPos, WPos) dicts when available."""
+
+        if not self.is_connected():
+            return None, None
+        if self._use_simulation:
+            positions = self.get_positions()
+            return positions, positions
+
+        line = self._query_status_line(timeout=timeout)
+        if not line:
+            return None, None
+        return self._parse_status_positions(line)
+
+    def read_status_position(
+        self,
+        axis: str,
+        *,
+        use_machine: bool = False,
+        timeout: float = 0.2,
+    ) -> Optional[float]:
+        """Return the axis position from GRBL status (MPos/WPos) or None."""
+
+        axis = normalise_axis(axis)
+        mpos, wpos = self.read_status_positions(timeout=timeout)
+        preferred = mpos if use_machine else wpos
+        if preferred and axis in preferred:
+            return float(preferred[axis])
+        return None
+
     # ------------------------------------------------------------------ #
     # Internal helpers                                                   #
     # ------------------------------------------------------------------ #
@@ -424,6 +459,52 @@ class MotorController:
                 self._movement_direction = 0
                 self._movement_speed = 0.0
             self._logger.debug("Hardware motion thread finished for axis %s", axis)
+
+    def _query_status_line(self, *, timeout: float = 0.2) -> Optional[str]:
+        if self._use_simulation:
+            return None
+        self._ensure_connected()
+        status_line: Dict[str, Optional[str]] = {"line": None}
+        event = threading.Event()
+
+        def _listener(line: str) -> None:
+            if line.startswith("<"):
+                status_line["line"] = line
+                event.set()
+
+        with self._status_query_lock:
+            unregister = self._driver.register_line_listener(_listener)
+            try:
+                self.send_raw(b"?")
+                event.wait(timeout)
+            finally:
+                unregister()
+
+        return status_line["line"]
+
+    def _parse_status_positions(
+        self, line: str
+    ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
+        if not line or not line.startswith("<"):
+            return None, None
+        return (
+            self._extract_status_positions(line, "MPos:"),
+            self._extract_status_positions(line, "WPos:"),
+        )
+
+    def _extract_status_positions(self, line: str, token: str) -> Optional[Dict[str, float]]:
+        if token not in line:
+            return None
+        segment = line.split(token, 1)[1].split("|", 1)[0]
+        parts = segment.split(",")
+        axes = ("X", "Y", "Z")
+        positions: Dict[str, float] = {}
+        for axis, value in zip(axes, parts):
+            try:
+                positions[axis] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return positions or None
 
     def _apply_increment(self, axis: str, delta: float) -> None:
         """Apply a simulated or estimated delta to the cached axis position."""
