@@ -6,7 +6,7 @@
   "default_axis": "X",
   "default_baud": 115200,
   "default_port": "COM7",
-  "default_speed": 200,
+  "default_speed": 500,
   "goto_feed": 1600.0,
   "homing_clearance": 3.0,
   "homing_feed": 1600.0,

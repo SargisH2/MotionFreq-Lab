@@ -787,13 +787,15 @@ class GRBLInterface:
             if not self.is_connected():
                 return None
             try:
-                positions = backend.get_positions()
+                mpos, _wpos = backend.read_status_positions(timeout=0.3)
             except Exception:
                 return None
+            if not mpos:
+                return None
             return {
-                "X": positions.get("X", 0.0),
-                "Y": positions.get("Y", 0.0),
-                "Z": positions.get("Z", 0.0),
+                "X": mpos.get("X", 0.0),
+                "Y": mpos.get("Y", 0.0),
+                "Z": mpos.get("Z", 0.0),
             }
         m = None
         for _ in range(tries):
@@ -833,6 +835,16 @@ class GRBLInterface:
             self.home_y_mpos = pos
         self.last_home_mpos[ax] = pos
         self.log(f"🏠 Captured {ax} Home (MPos): {pos:.3f}")
+        if self._send_line_wait_ok(f"G10 L20 P0 {ax}0", timeout=2.0):
+            backend = self._motor_backend()
+            if backend is not None:
+                try:
+                    backend.set_position(ax, 0.0)
+                except Exception:
+                    pass
+            self.log(f"✓ Set {ax} work coordinate to 0.000 at current position")
+        else:
+            self.log(f"⚠ Failed to set {ax} work coordinate to 0.000")
 
     def capture_x_home(self):
         self._capture_home("X")
@@ -861,6 +873,7 @@ class GRBLInterface:
         if not self.is_connected():
             self.log("❌ Not connected")
             return
+        home_target = self._get_home_target(ax)
         backend = self._motor_backend()
         if backend is not None:
             try:
@@ -869,22 +882,23 @@ class GRBLInterface:
                 base_feed = 1600.0
             gentle = min(1600.0, max(60.0, base_feed))
             try:
-                current = backend.get_position(ax)
+                current = backend.read_status_position(ax, use_machine=True, timeout=0.3)
+                if current is None:
+                    current = backend.get_position(ax)
             except Exception as exc:
                 self.log(f"⚠ Could not read current position: {exc}")
                 return
-            delta = -current
+            target = home_target if home_target is not None else 0.0
+            delta = target - current
             if abs(delta) < 1e-3:
-                self.log(f"✅ Already at {ax} home (0.000).")
+                self.log(f"✅ Already at {ax} Home ({target:.3f}).")
                 return
             try:
                 backend.jog_increment(ax, delta, gentle)
-                self._set_home_target(ax, 0.0)
-                self.log(f"📍 Jogging to {ax} Home (0.000)")
+                self.log(f"📍 Jogging to {ax} Home ({target:.3f})")
             except Exception as exc:
                 self.log(f"❌ Failed to move to {ax} home: {exc}")
             return
-        home_target = self._get_home_target(ax)
         if home_target is None:
             try:
                 base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
