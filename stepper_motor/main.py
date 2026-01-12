@@ -1863,10 +1863,18 @@ class GRBLInterface:
             if do_x and self.x_en.get():
                 homed_ok &= self._home_one_axis_release("X", long_mm, feed, clear_mm)
                 if homed_ok and do_y and self.y_en.get():
-                    # Return X to its captured home before starting Y
+                    # Return X to its captured home before starting Y if it drifted.
                     try:
-                        self.log("↩ Moving X back to home before starting Y homing")
-                        self.go_x_home()
+                        home_x = self.last_home_mpos.get("X")
+                        cur = self.get_mpos() or {}
+                        cur_x = cur.get("X")
+                        if home_x is not None and cur_x is not None:
+                            if abs(cur_x - home_x) > 1e-2:
+                                self.log("↩ Moving X back to home before starting Y homing")
+                                self.go_x_home()
+                        else:
+                            self.log("↩ Moving X back to home before starting Y homing")
+                            self.go_x_home()
                     except Exception as exc:
                         self.log(f"⚠ Failed to return X to home before Y: {exc}")
                         homed_ok = False
@@ -2031,6 +2039,8 @@ class GRBLInterface:
                 self.last_home_mpos[ax] = minus_release
                 if ax == 'X':
                     self.home_x_mpos = minus_release
+                elif ax == 'Y':
+                    self.home_y_mpos = minus_release
             # Stop span measurement and record absolute span
             self.measure_active = False
             span = abs(self.measure_accum)
@@ -2042,12 +2052,6 @@ class GRBLInterface:
             if not self.safe_send(f"G92 {ax}0"):
                 return False
             self.wait_for_ok_or_idle(0.5)
-            # Reset cached home positions to WCS zero
-            if ax == 'X':
-                self.home_x_mpos = 0.0
-            elif ax == 'Y':
-                self.home_y_mpos = 0.0
-            self.last_home_mpos[ax] = 0.0
             backend = self._motor_backend()
             if backend is not None:
                 try:
