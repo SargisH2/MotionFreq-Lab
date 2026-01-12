@@ -6,11 +6,11 @@
   "default_axis": "Y",
   "default_baud": 115200,
   "default_port": "COM7",
-  "default_speed": 1000,
+  "default_speed": 100,
   "goto_feed": 1600.0,
   "homing_clearance": 3.0,
   "homing_feed": 1600.0,
   "homing_long_jog": 1600.0,
-  "jog_feed": 1000.0,
+  "jog_feed": 100.0,
   "jog_step": 1.0
 }

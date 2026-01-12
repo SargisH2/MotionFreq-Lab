@@ -200,6 +200,9 @@ class MeasurementsTab(ttk.Frame):
         self._daq_interval_sec = 0.0
         self._daq_auto_trigger = True
         self._active_daq_plot: Optional[PlotIdLiteral] = None
+        self._config_save_lock = threading.Lock()
+        self._config_save_pending: Optional[MotorConfig] = None
+        self._config_save_running = False
 
         self._build_ui()
         self._poll_status()
@@ -676,13 +679,28 @@ class MeasurementsTab(ttk.Frame):
 
     def _persist_motor_config(self) -> None:
         """Write the latest motor defaults to disk."""
-        cfg = self._capture_motor_config(load_motor_config())
-        try:
-            save_motor_config(cfg)
-        except Exception:
-            LOGGER.exception("Failed to save motor config", exc_info=True)
-        else:
-            self._motor_config = cfg
+        cfg = self._capture_motor_config(self._motor_config)
+        self._motor_config = cfg
+        with self._config_save_lock:
+            self._config_save_pending = cfg
+            if self._config_save_running:
+                return
+            self._config_save_running = True
+
+        def worker() -> None:
+            while True:
+                with self._config_save_lock:
+                    pending = self._config_save_pending
+                    self._config_save_pending = None
+                    if pending is None:
+                        self._config_save_running = False
+                        return
+                try:
+                    save_motor_config(pending)
+                except Exception:
+                    LOGGER.exception("Failed to save motor config", exc_info=True)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _get_combo_values(self, combo: ttk.Combobox) -> list[str]:
         """Return the list backing a readonly combobox."""
