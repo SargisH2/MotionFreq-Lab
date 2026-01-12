@@ -6,6 +6,7 @@ import threading
 import time
 import re
 import logging
+import queue
 from collections import deque
 from typing import Callable, Optional
 
@@ -41,6 +42,7 @@ class GRBLInterface:
     ):
         LOGGER.info("Initialising GRBLInterface (set_title=%s, master=%s)", set_title, type(master).__name__)
         self.master = master
+        self._ui_thread = threading.current_thread()
         self.ser = None
         self.reader_thread = None
         self.reader_alive = threading.Event()
@@ -51,9 +53,18 @@ class GRBLInterface:
         self.line_lock = threading.Lock()
         self.status_lock = threading.Lock()
         self.last_status = ""
+        self._last_wco = None
+        self._last_mpos = None
+        self._last_wpos = None
         self.alarm_event = threading.Event()
         self.stop_event = threading.Event()
         self.original_status_mask = None  # $10 original value to restore (if changed)
+        self._status_poll_stop = threading.Event()
+        self._status_poll_thread = None
+        self._status_poll_interval = 0.1
+        self._motor_task_queue: "queue.Queue[tuple[Callable[..., None], tuple, dict, str]]" = queue.Queue(maxsize=20)
+        self._motor_task_thread = None
+        self._motor_task_stop = threading.Event()
         self.machine_state = tk.StringVar(value="Disconnected")
         self._motor_config: MotorConfig = motor_config or load_motor_config()
         enable_backend = USE_MOTOR_BACKEND_DEFAULT if enable_motor_backend is None else bool(enable_motor_backend)
@@ -297,7 +308,7 @@ class GRBLInterface:
         # kick off UI log flusher
         self.master.after(40, self._flush_ui_log)
         # kick off periodic status polling for position display
-        self.master.after(200, self._poll_status_and_update_ui)
+        self.master.after(100, self._poll_status_and_update_ui)
         LOGGER.info("GRBLInterface initialised")
 
     # -------------------- Connection helpers --------------------
@@ -388,6 +399,8 @@ class GRBLInterface:
                 self._pending_hard_limits_enable = True
                 self.master.after(250, self._maybe_enable_hard_limits)
                 self._update_port_defaults(port, baud)
+                self._start_status_polling()
+                self._start_motor_worker()
             except MotorError as exc:
                 messagebox.showerror("Connection error", str(exc))
                 self.set_state("Disconnected")
@@ -406,6 +419,8 @@ class GRBLInterface:
             self._pending_hard_limits_enable = True
             self.master.after(250, self._maybe_enable_hard_limits)
             self._update_port_defaults(port, baud)
+            self._start_status_polling()
+            self._start_motor_worker()
         except Exception as e:
             messagebox.showerror("Connection error", str(e))
             self.set_state("Disconnected")
@@ -421,6 +436,8 @@ class GRBLInterface:
         self.connect()
 
     def disconnect(self):
+        self._stop_status_polling()
+        self._stop_motor_worker()
         backend = self._motor_backend()
         if backend is not None:
             try:
@@ -1068,15 +1085,111 @@ class GRBLInterface:
     def query_status(self):
         self.safe_send_raw(b"?")
 
+    def _motor_task_loop(self) -> None:
+        while not self._motor_task_stop.is_set():
+            try:
+                func, args, kwargs, label = self._motor_task_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                func(*args, **kwargs)
+            except Exception as exc:
+                self.log(f"❌ {label} failed: {exc}")
+
+    def _start_motor_worker(self) -> None:
+        if self._motor_task_thread and self._motor_task_thread.is_alive():
+            return
+        self._motor_task_stop.clear()
+        thread = threading.Thread(
+            target=self._motor_task_loop,
+            name="MotorTaskWorker",
+            daemon=True,
+        )
+        self._motor_task_thread = thread
+        thread.start()
+
+    def _stop_motor_worker(self) -> None:
+        self._motor_task_stop.set()
+        thread = self._motor_task_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=0.5)
+        self._motor_task_thread = None
+        self._motor_task_stop.clear()
+        try:
+            while True:
+                self._motor_task_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _queue_motor_task(
+        self,
+        func: Callable[[], None],
+        *args,
+        label: str = "Motor task",
+        **kwargs,
+    ) -> bool:
+        if self._motor_backend() is None:
+            return False
+        self._start_motor_worker()
+        try:
+            self._motor_task_queue.put_nowait((func, args, kwargs, label))
+        except queue.Full:
+            self.log("⚠ Motor busy; command dropped.")
+            return False
+        return True
+
+    def _send_status_query(self) -> None:
+        backend = self._motor_backend()
+        if backend is not None:
+            try:
+                backend.send_raw(b"?")
+            except Exception:
+                pass
+            return
+        if self.ser is None:
+            return
+        try:
+            self.ser.write(b"?")
+        except Exception:
+            pass
+
+    def _status_poll_loop(self) -> None:
+        while not self._status_poll_stop.is_set():
+            if not self.is_connected():
+                time.sleep(0.1)
+                continue
+            self._send_status_query()
+            time.sleep(self._status_poll_interval)
+
+    def _start_status_polling(self) -> None:
+        if self._status_poll_thread and self._status_poll_thread.is_alive():
+            return
+        self._status_poll_stop.clear()
+        thread = threading.Thread(
+            target=self._status_poll_loop,
+            name="GRBLStatusPoller",
+            daemon=True,
+        )
+        self._status_poll_thread = thread
+        thread.start()
+
+    def _stop_status_polling(self) -> None:
+        self._status_poll_stop.set()
+        thread = self._status_poll_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=0.5)
+        self._status_poll_thread = None
+        self._status_poll_stop.clear()
+
     # -------------------- Live position UI --------------------
     def _parse_status_line(self, line: str):
         """
         Parse a GRBL status line like:
         <Idle|MPos:1.000,2.000,0.000|WPos:1.000,2.000,0.000|...>
-        Returns dict with keys: state, mpos (tuple), wpos (tuple)
+        Returns dict with keys: state, mpos (tuple), wpos (tuple), wco (tuple)
         Any missing field becomes None.
         """
-        out = {"state": None, "mpos": None, "wpos": None}
+        out = {"state": None, "mpos": None, "wpos": None, "wco": None}
         if not line or not line.startswith("<"):
             return out
         # State
@@ -1106,6 +1219,25 @@ class GRBLInterface:
                 while len(vals) < 3:
                     vals.append(0.0)
                 out["wpos"] = (vals[0], vals[1], vals[2])
+        except Exception:
+            pass
+        # WCO
+        try:
+            if "WCO:" in line:
+                seg = line.split("WCO:", 1)[1]
+                nums = seg.split("|", 1)[0].split(",")
+                vals = [float(x) for x in nums[:3]]
+                while len(vals) < 3:
+                    vals.append(0.0)
+                out["wco"] = (vals[0], vals[1], vals[2])
+        except Exception:
+            pass
+        try:
+            wco = out["wco"] or self._last_wco
+            if out["mpos"] and wco and not out["wpos"]:
+                out["wpos"] = tuple(m - o for m, o in zip(out["mpos"], wco))
+            if out["wpos"] and wco and not out["mpos"]:
+                out["mpos"] = tuple(w + o for w, o in zip(out["wpos"], wco))
         except Exception:
             pass
         return out
@@ -1155,15 +1287,46 @@ class GRBLInterface:
                 if snap and snap.connected:
                     port_label = snap.port or ("Simulated Motor" if getattr(backend, "is_simulation", False) else "Unknown")
                     state_txt = f"Connected {port_label}"
+                    with self.status_lock:
+                        ls = self.last_status
+                    st = self._parse_status_line(ls)
+                    if st.get("wco"):
+                        self._last_wco = st["wco"]
+                    if st.get("mpos"):
+                        self._last_mpos = st["mpos"]
+                    if st.get("wpos"):
+                        self._last_wpos = st["wpos"]
+                    mpos = st.get("mpos") or self._last_mpos
+                    wpos = st.get("wpos") or self._last_wpos
                     if hasattr(self, "state_var"):
-                        self.state_var.set("Moving" if snap.moving else "Idle")
-                    positions = snap.positions or {}
+                        if st.get("state"):
+                            self.state_var.set(st["state"])
+                        else:
+                            self.state_var.set("Moving" if snap.moving else "Idle")
+                    if getattr(backend, "is_simulation", False) and snap:
+                        sim_pos = snap.positions or {}
+                        if not mpos:
+                            mpos = (
+                                sim_pos.get("X", 0.0),
+                                sim_pos.get("Y", 0.0),
+                                sim_pos.get("Z", 0.0),
+                            )
+                        if not wpos:
+                            wpos = mpos
                     if hasattr(self, "mpos_x"):
-                        self.mpos_x.set(f"{positions.get('X', 0.0):.3f}")
-                        self.mpos_y.set(f"{positions.get('Y', 0.0):.3f}")
+                        if mpos:
+                            self.mpos_x.set(f"{mpos[0]:.3f}")
+                            self.mpos_y.set(f"{mpos[1]:.3f}")
+                        else:
+                            self.mpos_x.set("n/a")
+                            self.mpos_y.set("n/a")
                     if hasattr(self, "wpos_x"):
-                        self.wpos_x.set(f"{positions.get('X', 0.0):.3f}")
-                        self.wpos_y.set(f"{positions.get('Y', 0.0):.3f}")
+                        if wpos:
+                            self.wpos_x.set(f"{wpos[0]:.3f}")
+                            self.wpos_y.set(f"{wpos[1]:.3f}")
+                        else:
+                            self.wpos_x.set("n/a")
+                            self.wpos_y.set("n/a")
                 if state_txt != self._last_state_text:
                     self._last_state_text = state_txt
                     self.machine_state.set(state_txt)
@@ -1171,13 +1334,19 @@ class GRBLInterface:
                 with self.status_lock:
                     ls = self.last_status
                 st = self._parse_status_line(ls)
+                if st.get("wco"):
+                    self._last_wco = st["wco"]
+                if st.get("mpos"):
+                    self._last_mpos = st["mpos"]
+                if st.get("wpos"):
+                    self._last_wpos = st["wpos"]
+                mpos = st.get("mpos") or self._last_mpos
+                wpos = st.get("wpos") or self._last_wpos
                 if hasattr(self, 'state_var') and st.get('state'):
                     self.state_var.set(st['state'])
-                mpos = st.get('mpos')
                 if mpos and hasattr(self, 'mpos_x'):
                     self.mpos_x.set(f"{mpos[0]:.3f}")
                     self.mpos_y.set(f"{mpos[1]:.3f}")
-                wpos = st.get('wpos')
                 if wpos and hasattr(self, 'wpos_x'):
                     self.wpos_x.set(f"{wpos[0]:.3f}")
                     self.wpos_y.set(f"{wpos[1]:.3f}")
@@ -1187,7 +1356,7 @@ class GRBLInterface:
             pass
         # Reschedule
         try:
-            self.master.after(250, self._poll_status_and_update_ui)
+            self.master.after(100, self._poll_status_and_update_ui)
         except Exception:
             pass
 
@@ -1228,23 +1397,31 @@ class GRBLInterface:
         backend = self._motor_backend()
         if backend is not None:
             feed_value = max(1.0, feed_mm)
-            try:
-                if x_mm is not None:
-                    if mode == 'abs':
-                        backend.move_to_coordinate("X", x_mm, feed=feed_value)
-                        self.log(f"→ Move: X -> {x_mm:.3f} mm @ F{feed_value:.1f}")
-                    else:
-                        backend.move_by("X", x_mm, feed=feed_value)
-                        self.log(f"→ Move: X Δ{x_mm:.3f} mm @ F{feed_value:.1f}")
-                if y_mm is not None:
-                    if mode == 'abs':
-                        backend.move_to_coordinate("Y", y_mm, feed=feed_value)
-                        self.log(f"→ Move: Y -> {y_mm:.3f} mm @ F{feed_value:.1f}")
-                    else:
-                        backend.move_by("Y", y_mm, feed=feed_value)
-                        self.log(f"→ Move: Y Δ{y_mm:.3f} mm @ F{feed_value:.1f}")
-            except Exception as exc:
-                self.log(f"❌ Motor move failed: {exc}")
+            def _do_move(
+                backend=backend,
+                mode=mode,
+                x_mm=x_mm,
+                y_mm=y_mm,
+                feed_value=feed_value,
+            ) -> None:
+                try:
+                    if x_mm is not None:
+                        if mode == 'abs':
+                            backend.move_to_coordinate("X", x_mm, feed=feed_value)
+                            self.log(f"→ Move: X -> {x_mm:.3f} mm @ F{feed_value:.1f}")
+                        else:
+                            backend.move_by("X", x_mm, feed=feed_value)
+                            self.log(f"→ Move: X Δ{x_mm:.3f} mm @ F{feed_value:.1f}")
+                    if y_mm is not None:
+                        if mode == 'abs':
+                            backend.move_to_coordinate("Y", y_mm, feed=feed_value)
+                            self.log(f"→ Move: Y -> {y_mm:.3f} mm @ F{feed_value:.1f}")
+                        else:
+                            backend.move_by("Y", y_mm, feed=feed_value)
+                            self.log(f"→ Move: Y Δ{y_mm:.3f} mm @ F{feed_value:.1f}")
+                except Exception as exc:
+                    self.log(f"❌ Motor move failed: {exc}")
+            self._queue_motor_task(_do_move, label="Move command")
             return
 
         # Build move in requested mode
@@ -1311,6 +1488,25 @@ class GRBLInterface:
         """Use $J incremental jog: $J=G91 X... F..."""
         backend = self._motor_backend()
         if backend is not None:
+            if threading.current_thread() is self._ui_thread:
+                def _do_jog(
+                    backend=backend,
+                    axis=axis.upper(),
+                    distance=distance,
+                    feed=feed,
+                ) -> None:
+                    try:
+                        backend.jog_increment(axis, distance, feed)
+                    except Exception as exc:
+                        self.log(f"❌ Jog failed: {exc}")
+                        return
+                    try:
+                        if self.measure_active and axis == (self.measure_axis or ""):
+                            self.measure_accum += distance
+                    except Exception:
+                        pass
+                self._queue_motor_task(_do_jog, label="Jog")
+                return
             try:
                 backend.jog_increment(axis.upper(), distance, feed)
             except Exception as exc:

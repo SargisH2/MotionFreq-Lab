@@ -108,7 +108,8 @@ class SerialMotorDriver:
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_stop = threading.Event()
         self._response_queue: "queue.Queue[str]" = queue.Queue(maxsize=64)
-        self._write_lock = threading.Lock()
+        self._command_lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._listener_counter = count(1)
         self._line_listeners: dict[int, LineListener] = {}
         self._listener_lock = threading.Lock()
@@ -362,15 +363,16 @@ class SerialMotorDriver:
         handle = self._serial_handle
         if handle is None:
             raise MotorError("Serial handle not available.")
-        with self._write_lock:
+        with self._command_lock:
             if wait_for_ok and not self.is_simulation:
                 self._drain_response_queue()
             if not command.endswith("\r\n"):
                 command = f"{command}\r\n"
             self._logger.debug("-> %s", command.strip())
             out = command.encode("ascii")
-            handle.write(out)
-            handle.flush()
+            with self._io_lock:
+                handle.write(out)
+                handle.flush()
             if wait_for_ok and not self.is_simulation:
                 self._await_ok(timeout)
 
@@ -380,7 +382,7 @@ class SerialMotorDriver:
         handle = self._serial_handle
         if handle is None:
             raise MotorError("Serial handle not available.")
-        with self._write_lock:
+        with self._io_lock:
             handle.write(payload)
             handle.flush()
 
