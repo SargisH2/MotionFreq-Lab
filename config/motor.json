@@ -3,14 +3,14 @@
     "X": true,
     "Y": true
   },
-  "default_axis": "Y",
+  "default_axis": "X",
   "default_baud": 115200,
   "default_port": "COM7",
-  "default_speed": 100,
+  "default_speed": 200,
   "goto_feed": 1600.0,
   "homing_clearance": 3.0,
   "homing_feed": 1600.0,
   "homing_long_jog": 1600.0,
-  "jog_feed": 100.0,
-  "jog_step": 1.0
+  "jog_feed": 500.0,
+  "jog_step": 10.0
 }

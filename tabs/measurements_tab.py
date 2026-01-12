@@ -359,7 +359,7 @@ class MeasurementsTab(ttk.Frame):
         ttk.Entry(top, textvariable=self.accel_var, width=8).grid(row=2, column=5, padx=(4, 8), pady=(4, 0))
 
         ttk.Label(top, text="Coord:").grid(row=2, column=6, sticky="w", pady=(4, 0))
-        self.coord_var = tk.StringVar(value="WPos")
+        self.coord_var = tk.StringVar(value="MPos")
         self.coord_combo = ttk.Combobox(
             top,
             values=("WPos", "MPos"),
@@ -853,7 +853,7 @@ class MeasurementsTab(ttk.Frame):
             self._active_daq_plot = plot_id
 
     def _coord_system(self) -> str:
-        value = (self.coord_var.get() or "WPos").strip().upper()
+        value = (self.coord_var.get() or "MPos").strip().upper()
         return "machine" if value.startswith("M") else "work"
 
     def _read_sweep_settings(self) -> Tuple[float, float, float, str]:
@@ -924,8 +924,13 @@ class MeasurementsTab(ttk.Frame):
                 if current is not None:
                     break
         if current is None:
-            self._logger.warning("Status position unavailable; skipping start confirmation")
-            return True
+            coord_label = "MPos" if coord_system == "machine" else "WPos"
+            runtime.stop_reason = "status_missing"
+            self._report_error(
+                f"GRBL status does not include {coord_label}. "
+                "Enable it in $10 or switch the coordinate selector."
+            )
+            return False
         timeout = self._estimate_move_timeout(current, target_mm, speed)
         deadline = time.monotonic() + timeout
         while not stop_event.is_set() and time.monotonic() < deadline:
@@ -1019,7 +1024,8 @@ class MeasurementsTab(ttk.Frame):
 
         if not self._wait_for_target_position(runtime, axis, start_mm, coord_system, speed, stop_event):
             if not stop_event.is_set():
-                self._report_error("Timed out waiting for start position.")
+                if runtime.stop_reason != "status_missing":
+                    self._report_error("Timed out waiting for start position.")
             stop_event.set()
             return
 
