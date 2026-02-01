@@ -1018,20 +1018,32 @@ class MeasurementsTab(ttk.Frame):
 
         if mode == "pos_from_zero" and end_mm >= start_mm:
             other_axis = "Y" if axis.upper() == "X" else "X"
-            try:
-                if coord_system == "machine":
-                    self._motor.send_line(f"G53 G1 {other_axis}0.000 F{speed:.1f}")
-                else:
-                    self._motor.send_line(f"G1 {other_axis}0.000 F{speed:.1f}")
-            except MotorError as exc:
-                self._report_error(f"Failed to move {other_axis} to zero: {exc}")
-                stop_event.set()
-                return
-            if not self._wait_for_target_position(runtime, other_axis, 0.0, coord_system, speed, stop_event):
-                if not stop_event.is_set():
-                    self._report_error(f"Timed out waiting for {other_axis} to reach zero.")
-                stop_event.set()
-                return
+            cfg = self._motor_config
+            if not bool(getattr(cfg, "axis_enabled", {}).get(other_axis, True)):
+                other_axis = ""
+            if other_axis:
+                try:
+                    if coord_system == "machine":
+                        self._motor.send_line(f"G53 G1 {other_axis}0.000 F{speed:.1f}")
+                    else:
+                        self._motor.send_line(f"G1 {other_axis}0.000 F{speed:.1f}")
+                except MotorError as exc:
+                    if coord_system == "machine":
+                        try:
+                            self._motor.send_line(f"G1 {other_axis}0.000 F{speed:.1f}")
+                        except MotorError:
+                            self._report_error(f"Failed to move {other_axis} to zero: {exc}")
+                            stop_event.set()
+                            return
+                    else:
+                        self._report_error(f"Failed to move {other_axis} to zero: {exc}")
+                        stop_event.set()
+                        return
+                if not self._wait_for_target_position(runtime, other_axis, 0.0, coord_system, speed, stop_event):
+                    if not stop_event.is_set():
+                        self._report_error(f"Timed out waiting for {other_axis} to reach zero.")
+                    stop_event.set()
+                    return
 
         try:
             self._motor.send_line(self._build_move_command(axis, start_mm, speed, coord_system))
