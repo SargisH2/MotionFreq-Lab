@@ -238,10 +238,14 @@ class MeasurementsTab(ttk.Frame):
             axis_choices = list(AXES)
         axis_default = cfg.default_axis if cfg.default_axis in axis_choices else axis_choices[0]
 
-        ttk.Label(top, text="Motor Feed (mm/min):").grid(row=0, column=0, sticky="w")
+        motor_row = ttk.Frame(top)
+        motor_row.grid(row=0, column=0, sticky="ew")
+        motor_row.columnconfigure(9, weight=1)
+
+        ttk.Label(motor_row, text="Motor Feed (mm/min):").grid(row=0, column=0, sticky="w")
         self.speed_var = tk.DoubleVar(value=max(1.0, speed_default))
         self.speed_spin = ttk.Spinbox(
-            top,
+            motor_row,
             from_=1.0,
             to=30000.0,
             increment=10.0,
@@ -254,10 +258,10 @@ class MeasurementsTab(ttk.Frame):
         self.speed_spin.bind("<FocusOut>", lambda _: self._on_speed_changed())
         self.speed_spin.bind("<Return>", lambda _: self._on_speed_changed())
 
-        ttk.Label(top, text="Start Feed (mm/min):").grid(row=0, column=11, sticky="w")
+        ttk.Label(motor_row, text="Start Feed (mm/min):").grid(row=0, column=2, sticky="w")
         self.start_speed_var = tk.DoubleVar(value=max(1.0, speed_default))
         self.start_speed_spin = ttk.Spinbox(
-            top,
+            motor_row,
             from_=1.0,
             to=30000.0,
             increment=10.0,
@@ -266,124 +270,128 @@ class MeasurementsTab(ttk.Frame):
             format="%.1f",
             command=self._on_start_speed_changed,
         )
-        self.start_speed_spin.grid(row=0, column=12, padx=(4, 0))
+        self.start_speed_spin.grid(row=0, column=3, padx=(4, 8))
         self.start_speed_spin.bind("<FocusOut>", lambda _: self._on_start_speed_changed())
         self.start_speed_spin.bind("<Return>", lambda _: self._on_start_speed_changed())
 
-        ttk.Label(top, text="Axis:").grid(row=0, column=2, sticky="w")
+        ttk.Label(motor_row, text="Axis:").grid(row=0, column=4, sticky="w")
         self.axis_var = tk.StringVar(value=axis_default)
-        self.axis_combo = ttk.Combobox(top, values=axis_choices, textvariable=self.axis_var, state="readonly", width=3)
-        self.axis_combo.grid(row=0, column=3, padx=(4, 12))
+        self.axis_combo = ttk.Combobox(
+            motor_row, values=axis_choices, textvariable=self.axis_var, state="readonly", width=3
+        )
+        self.axis_combo.grid(row=0, column=5, padx=(4, 12))
 
-        ttk.Label(top, text="Port:").grid(row=0, column=4, sticky="w")
+        ttk.Label(motor_row, text="Port:").grid(row=0, column=6, sticky="w")
         self.port_var = tk.StringVar(value=cfg.default_port)
-        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, state="readonly", width=14)
-        self.port_combo.grid(row=0, column=5, padx=(4, 8))
+        self.port_combo = ttk.Combobox(motor_row, textvariable=self.port_var, state="readonly", width=14)
+        self.port_combo.grid(row=0, column=7, padx=(4, 8))
 
-        self.refresh_btn = ttk.Button(top, text="Refresh", command=self.refresh_ports)
-        self.refresh_btn.grid(row=0, column=6, padx=(0, 8))
+        motor_btns = ttk.Frame(top)
+        motor_btns.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.refresh_btn = ttk.Button(motor_btns, text="Refresh", command=self.refresh_ports)
+        self.refresh_btn.grid(row=0, column=0, padx=(0, 6))
+        self.connect_btn = ttk.Button(motor_btns, text="Connect", command=self.connect_motor)
+        self.connect_btn.grid(row=0, column=1, padx=(0, 6))
+        self.disconnect_btn = ttk.Button(motor_btns, text="Disconnect", command=self.disconnect_motor)
+        self.disconnect_btn.grid(row=0, column=2, padx=(0, 6))
+        self.home_btn = ttk.Button(motor_btns, text="Home to Zero", command=self.home_motor)
+        self.home_btn.grid(row=0, column=3, padx=(0, 6))
+        self.stop_btn = ttk.Button(motor_btns, text="Stop Motor", command=self.stop_motor)
+        self.stop_btn.grid(row=0, column=4, padx=(0, 6))
 
-        self.connect_btn = ttk.Button(top, text="Connect", command=self.connect_motor)
-        self.connect_btn.grid(row=0, column=7, padx=(0, 4))
+        daq_row = ttk.Frame(top)
+        daq_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
-        self.disconnect_btn = ttk.Button(top, text="Disconnect", command=self.disconnect_motor)
-        self.disconnect_btn.grid(row=0, column=8, padx=(0, 4))
-
-        self.home_btn = ttk.Button(top, text="Home to Zero", command=self.home_motor)
-        self.home_btn.grid(row=0, column=9, padx=(8, 4))
-
-        self.stop_btn = ttk.Button(top, text="Stop Motor", command=self.stop_motor)
-        self.stop_btn.grid(row=0, column=10, padx=(4, 0))
-
-        ttk.Label(top, text="DAQ Port:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="DAQ Port:").grid(row=0, column=0, sticky="w")
         self.daq_port_var = tk.StringVar()
-        self.daq_port_combo = ttk.Combobox(top, textvariable=self.daq_port_var, state="readonly", width=14)
-        self.daq_port_combo.grid(row=1, column=1, padx=(4, 8), pady=(4, 0))
+        self.daq_port_combo = ttk.Combobox(daq_row, textvariable=self.daq_port_var, state="readonly", width=14)
+        self.daq_port_combo.grid(row=0, column=1, padx=(4, 8))
 
-        ttk.Label(top, text="DAQ Mode:").grid(row=1, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="DAQ Mode:").grid(row=0, column=2, sticky="w")
         self.daq_mode_var = tk.IntVar(value=DEFAULT_MODE)
         self.daq_mode_spin = ttk.Spinbox(
-            top,
+            daq_row,
             from_=0,
             to=255,
             textvariable=self.daq_mode_var,
             width=5,
             command=self._on_daq_params_changed,
         )
-        self.daq_mode_spin.grid(row=1, column=3, padx=(4, 12), pady=(4, 0))
+        self.daq_mode_spin.grid(row=0, column=3, padx=(4, 12))
         self.daq_mode_spin.bind("<FocusOut>", lambda _: self._on_daq_params_changed())
         self.daq_mode_spin.bind("<Return>", lambda _: self._on_daq_params_changed())
 
-        ttk.Label(top, text="DAQ K:").grid(row=1, column=4, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="DAQ K:").grid(row=0, column=4, sticky="w")
         self.daq_k_var = tk.IntVar(value=DEFAULT_K_VALUE)
         self.daq_k_spin = ttk.Spinbox(
-            top,
+            daq_row,
             from_=1,
             to=255,
             textvariable=self.daq_k_var,
             width=5,
             command=self._on_daq_params_changed,
         )
-        self.daq_k_spin.grid(row=1, column=5, padx=(4, 0), pady=(4, 0))
+        self.daq_k_spin.grid(row=0, column=5, padx=(4, 12))
         self.daq_k_spin.bind("<FocusOut>", lambda _: self._on_daq_params_changed())
         self.daq_k_spin.bind("<Return>", lambda _: self._on_daq_params_changed())
 
-        ttk.Label(top, text="DAQ Baud:").grid(row=1, column=6, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="DAQ Baud:").grid(row=0, column=6, sticky="w")
         self.daq_baud_var = tk.StringVar(value=str(DEFAULT_BAUDRATE))
-        ttk.Entry(top, textvariable=self.daq_baud_var, width=8).grid(row=1, column=7, padx=(4, 0), pady=(4, 0))
+        ttk.Entry(daq_row, textvariable=self.daq_baud_var, width=8).grid(row=0, column=7, padx=(4, 8))
 
-        ttk.Label(top, text="Timeout (s):").grid(row=1, column=8, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="Timeout (s):").grid(row=0, column=8, sticky="w")
         self.daq_timeout_var = tk.StringVar(value=str(self._daq.read_timeout))
-        ttk.Entry(top, textvariable=self.daq_timeout_var, width=8).grid(row=1, column=9, padx=(4, 0), pady=(4, 0))
+        ttk.Entry(daq_row, textvariable=self.daq_timeout_var, width=8).grid(row=0, column=9, padx=(4, 8))
 
-        ttk.Label(top, text="Timer MP (s):").grid(row=1, column=10, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="Timer MP (s):").grid(row=0, column=10, sticky="w")
         self.daq_timer_mp_var = tk.StringVar(value=str(DEFAULT_TIMER_MP))
-        ttk.Entry(top, textvariable=self.daq_timer_mp_var, width=10).grid(row=1, column=11, padx=(4, 0), pady=(4, 0))
+        ttk.Entry(daq_row, textvariable=self.daq_timer_mp_var, width=10).grid(row=0, column=11, padx=(4, 8))
 
-        ttk.Label(top, text="Calibration:").grid(row=1, column=12, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="Calibration:").grid(row=0, column=12, sticky="w")
         self.daq_calibration_var = tk.StringVar(value=str(DEFAULT_CALIBRATION))
-        ttk.Entry(top, textvariable=self.daq_calibration_var, width=6).grid(row=1, column=13, padx=(4, 0), pady=(4, 0))
+        ttk.Entry(daq_row, textvariable=self.daq_calibration_var, width=6).grid(row=0, column=13, padx=(4, 8))
 
-        ttk.Label(top, text="Interval (s):").grid(row=1, column=14, sticky="w", pady=(4, 0))
+        ttk.Label(daq_row, text="Interval (s):").grid(row=0, column=14, sticky="w")
         self.daq_interval_var = tk.StringVar(value="0.0")
-        ttk.Entry(top, textvariable=self.daq_interval_var, width=8).grid(row=1, column=15, padx=(4, 0), pady=(4, 0))
+        ttk.Entry(daq_row, textvariable=self.daq_interval_var, width=8).grid(row=0, column=15, padx=(4, 8))
 
         self.daq_auto_trigger_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Auto trigger", variable=self.daq_auto_trigger_var).grid(
-            row=1, column=16, sticky="w", pady=(4, 0)
-        )
-        self.daq_connect_btn = ttk.Button(top, text="Connect DAQ", command=self.connect_daq)
-        self.daq_connect_btn.grid(row=1, column=17, padx=(4, 4), pady=(4, 0))
+        ttk.Checkbutton(daq_row, text="Auto trigger", variable=self.daq_auto_trigger_var).grid(row=0, column=16, sticky="w")
+        self.daq_connect_btn = ttk.Button(daq_row, text="Connect DAQ", command=self.connect_daq)
+        self.daq_connect_btn.grid(row=0, column=17, padx=(6, 4))
         self.daq_disconnect_btn = ttk.Button(
-            top,
+            daq_row,
             text="Disconnect DAQ",
             command=self.disconnect_daq,
             state=tk.DISABLED,
         )
-        self.daq_disconnect_btn.grid(row=1, column=18, padx=(0, 4), pady=(4, 0))
+        self.daq_disconnect_btn.grid(row=0, column=18, padx=(0, 4))
 
-        ttk.Label(top, text="Start (mm):").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        sweep_row = ttk.Frame(top)
+        sweep_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+        ttk.Label(sweep_row, text="Start (mm):").grid(row=0, column=0, sticky="w")
         self.start_pos_var = tk.StringVar(value="0.0")
-        ttk.Entry(top, textvariable=self.start_pos_var, width=8).grid(row=2, column=1, padx=(4, 8), pady=(4, 0))
+        ttk.Entry(sweep_row, textvariable=self.start_pos_var, width=8).grid(row=0, column=1, padx=(4, 8))
 
-        ttk.Label(top, text="End (mm):").grid(row=2, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(sweep_row, text="End (mm):").grid(row=0, column=2, sticky="w")
         self.end_pos_var = tk.StringVar(value="10.0")
-        ttk.Entry(top, textvariable=self.end_pos_var, width=8).grid(row=2, column=3, padx=(4, 8), pady=(4, 0))
+        ttk.Entry(sweep_row, textvariable=self.end_pos_var, width=8).grid(row=0, column=3, padx=(4, 8))
 
-        ttk.Label(top, text="Accel (mm/s^2):").grid(row=2, column=4, sticky="w", pady=(4, 0))
+        ttk.Label(sweep_row, text="Accel (mm/s^2):").grid(row=0, column=4, sticky="w")
         self.accel_var = tk.StringVar(value="100.0")
-        ttk.Entry(top, textvariable=self.accel_var, width=8).grid(row=2, column=5, padx=(4, 8), pady=(4, 0))
+        ttk.Entry(sweep_row, textvariable=self.accel_var, width=8).grid(row=0, column=5, padx=(4, 8))
 
-        ttk.Label(top, text="Coord:").grid(row=2, column=6, sticky="w", pady=(4, 0))
+        ttk.Label(sweep_row, text="Coord:").grid(row=0, column=6, sticky="w")
         self.coord_var = tk.StringVar(value="MPos")
         self.coord_combo = ttk.Combobox(
-            top,
+            sweep_row,
             values=("WPos", "MPos"),
             textvariable=self.coord_var,
             state="readonly",
             width=5,
         )
-        self.coord_combo.grid(row=2, column=7, padx=(4, 8), pady=(4, 0))
+        self.coord_combo.grid(row=0, column=7, padx=(4, 8))
 
         mode, k_val = self._daq.measurement_configuration
         self.daq_mode_var.set(mode)
