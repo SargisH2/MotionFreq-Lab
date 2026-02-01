@@ -1016,7 +1016,7 @@ class MeasurementsTab(ttk.Frame):
             stop_event.set()
             return
 
-        if mode == "pos_from_zero" and end_mm >= start_mm:
+        if mode in {"pos_from_zero", "neg_from_zero"}:
             other_axis = "Y" if axis.upper() == "X" else "X"
             cfg = self._motor_config
             if not bool(getattr(cfg, "axis_enabled", {}).get(other_axis, True)):
