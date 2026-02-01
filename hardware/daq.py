@@ -279,7 +279,7 @@ class FrequencyDAQ:
                 ):
                     yield frame
             except ControllerError as exc:
-                raise DataAcquisitionError(f"DAQ read failed: {exc}") from exc
+                raise DataAcquisitionError(f"DAQ read failed, try to increase timeout: {exc}") from exc
             finally:
                 self._stream_lock.release()
 

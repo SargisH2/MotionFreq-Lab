@@ -785,10 +785,24 @@ class MeasurementsTab(ttk.Frame):
     def stop_motor(self) -> None:
         """Stop the motor and terminate any active measurement."""
         self._logger.info("Stop motor requested by user")
-        self._motor.stop()
+        try:
+            self._motor.stop()
+        except MotorError as exc:
+            LOGGER.warning("Motor stop failed: %s", exc)
         if self._active_motor_plot is not None:
             self._stop_measurement(self._active_motor_plot)
             self._active_motor_plot = None
+        try:
+            port = self.port_var.get()
+            if port:
+                cfg = load_motor_config()
+                self._motor.disconnect()
+                time.sleep(0.1)
+                self._motor.connect(port, baudrate=int(getattr(cfg, "default_baud", 115200) or 115200))
+        except MotorError as exc:
+            LOGGER.exception("Motor reconnect after stop failed")
+            messagebox.showwarning("Motor reconnect failed", str(exc))
+        self._update_connection_buttons()
 
     # ------------------------------------------------------------------ #
     # Measurement orchestration

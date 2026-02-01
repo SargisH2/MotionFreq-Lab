@@ -1856,10 +1856,22 @@ class GRBLInterface:
                 self.log(f"⚠ Stop request failed: {exc}")
             else:
                 self.log("⏹ Stop requested")
+            try:
+                time.sleep(0.1)
+                self.reconnect()
+                self.log("🔌 Motor reconnected after stop")
+            except Exception as exc:
+                self.log(f"⚠ Reconnect after stop failed: {exc}")
         else:
             self.safe_send_raw(b"\x85")  # jog cancel
             self.stop_event.set()
             self.log("⏹ Stop requested")
+            try:
+                time.sleep(0.1)
+                self.reconnect()
+                self.log("🔌 Motor reconnected after stop")
+            except Exception as exc:
+                self.log(f"⚠ Reconnect after stop failed: {exc}")
 
     def _recover_after_alarm(self, note: str):
         self.log(f"↺ Recover after ALARM: {note}")
