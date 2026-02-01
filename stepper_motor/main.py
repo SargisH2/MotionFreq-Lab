@@ -891,7 +891,7 @@ class GRBLInterface:
         if not self.is_connected():
             self.log("❌ Not connected")
             return
-        if ensure_other_axes and not self._ensure_other_axes_ready({ax}):
+        if ensure_other_axes and not self._ensure_other_axes_ready({ax}, set()):
             return
         home_target = self._get_home_target(ax)
         backend = self._motor_backend()
@@ -1402,6 +1402,27 @@ class GRBLInterface:
             moving_axes.add("X")
         if y_mm is not None:
             moving_axes.add("Y")
+        require_on_positive = set()
+        if mode == "rel":
+            if x_mm is not None and x_mm > 0:
+                require_on_positive.add("X")
+            if y_mm is not None and y_mm > 0:
+                require_on_positive.add("Y")
+        else:
+            if x_mm is not None:
+                cur = self._read_wpos_axis("X")
+                if cur is None:
+                    if x_mm > 0:
+                        require_on_positive.add("X")
+                elif x_mm > cur:
+                    require_on_positive.add("X")
+            if y_mm is not None:
+                cur = self._read_wpos_axis("Y")
+                if cur is None:
+                    if y_mm > 0:
+                        require_on_positive.add("Y")
+                elif y_mm > cur:
+                    require_on_positive.add("Y")
 
         backend = self._motor_backend()
         if backend is not None:
@@ -1413,7 +1434,7 @@ class GRBLInterface:
                 y_mm=y_mm,
                 feed_value=feed_value,
             ) -> None:
-                if not self._ensure_other_axes_ready(moving_axes):
+                if not self._ensure_other_axes_ready(moving_axes, require_on_positive):
                     return
                 try:
                     if x_mm is not None:
@@ -1435,7 +1456,7 @@ class GRBLInterface:
             self._queue_motor_task(_do_move, label="Move command")
             return
 
-        if not self._ensure_other_axes_ready(moving_axes):
+        if not self._ensure_other_axes_ready(moving_axes, require_on_positive):
             return
 
         # Build move in requested mode
@@ -1510,7 +1531,8 @@ class GRBLInterface:
                     distance=distance,
                     feed=feed,
                 ) -> None:
-                    if not self._ensure_other_axes_ready({axis}):
+                    require = {axis} if distance > 0 else set()
+                    if not self._ensure_other_axes_ready({axis}, require):
                         return
                     try:
                         backend.jog_increment(axis, distance, feed)
@@ -1524,7 +1546,8 @@ class GRBLInterface:
                         pass
                 self._queue_motor_task(_do_jog, label="Jog")
                 return
-            if not self._ensure_other_axes_ready({axis}):
+            require = {axis} if distance > 0 else set()
+            if not self._ensure_other_axes_ready({axis}, require):
                 return
             try:
                 backend.jog_increment(axis, distance, feed)
@@ -1537,7 +1560,8 @@ class GRBLInterface:
             except Exception:
                 pass
             return
-        if not self._ensure_other_axes_ready({axis}):
+        require = {axis} if distance > 0 else set()
+        if not self._ensure_other_axes_ready({axis}, require):
             return
         cmd = f"$J=G91 {axis}{distance:.3f} F{feed:.1f}"
         if self.safe_send(cmd):
@@ -1888,74 +1912,55 @@ class GRBLInterface:
             return True
         return False
 
-    def _ensure_axis_home_before_move(self, axis: str) -> bool:
+    def _read_wpos_axis(self, axis: str) -> Optional[float]:
         ax = axis.upper()
-        if self._homing_active:
-            return True
+        try:
+            with self.status_lock:
+                st = self._parse_status_line(self.last_status)
+            wpos = st.get("wpos") or self._last_wpos
+            if wpos:
+                return float({"X": wpos[0], "Y": wpos[1], "Z": wpos[2]}.get(ax, 0.0))
+        except Exception:
+            pass
+        return None
+
+    def _move_axis_to_zero(self, axis: str) -> bool:
+        ax = axis.upper()
         if ax == "X" and hasattr(self, "x_en") and not self.x_en.get():
             return True
         if ax == "Y" and hasattr(self, "y_en") and not self.y_en.get():
             return True
-
-        span = self.last_span.get(ax)
-        if span is not None and span > 0:
-            self.log(f"↩ Ensuring {ax} at home before move")
-            self._go_home(ax, ensure_other_axes=False)
-            return True
-
-        # No length known: go to -limit, then release toward +, then set zero.
+        backend = self._motor_backend()
         try:
-            feed = float(self.feed_entry.get() or "1600")
+            base_feed = float(self.jog_feed.get() or self.feed_entry.get() or "1600")
         except Exception:
-            feed = 1600.0
-        try:
-            clear_mm = float(self.clear_entry.get() or "3")
-        except Exception:
-            clear_mm = 3.0
-        try:
-            long_mm = float(self.long_entry.get() or "1000")
-        except Exception:
-            long_mm = 1000.0
-
-        gentle = min(1600.0, max(100.0, float(feed or 1600.0)))
-        self.log(f"↩ Calibrating {ax} to home before move")
-        self.ensure_status_mask_with_pn()
-        self.safe_send("G91")
-        self.wait_for_ok_or_idle(0.2)
-        prev = self._homing_active
-        self._homing_active = True
-        try:
-            self.move_until_alarm(ax, -1, long_mm, feed, label="-limit")
-            self._recover_after_alarm("-limit")
-            if not self.clear_limit_with_retries(ax, away_dir=+1, feed_clear=gentle, step_mm=0.25, max_attempts=40):
-                self.log(f"❌ Could not release {ax} from limit before move.")
+            base_feed = 1600.0
+        gentle = min(1600.0, max(60.0, base_feed))
+        if backend is not None:
+            try:
+                backend.move_to_coordinate(ax, 0.0, feed=gentle)
+                self.log(f"↩ Move {ax} to 0.000 before + move")
+                return True
+            except Exception as exc:
+                self.log(f"❌ Failed to move {ax} to 0: {exc}")
                 return False
-            m = self.get_mpos() or {}
-            if ax in m:
-                self.last_home_mpos[ax] = m[ax]
-                if ax == "X":
-                    self.home_x_mpos = m[ax]
-                elif ax == "Y":
-                    self.home_y_mpos = m[ax]
-            if not self._set_work_zero_for_axis(ax):
-                self.log(f"❌ Failed to set {ax}0 before move.")
-                return False
-            return True
-        except Exception as exc:
-            self.log(f"❌ Failed to reach {ax}-limit before move: {exc}")
+        if not self.safe_send("G90"):
             return False
-        finally:
-            self._homing_active = prev
+        self.wait_for_ok_or_idle(0.2)
+        if not self.safe_send(f"G1 {ax}0.000 F{gentle:.1f}"):
+            return False
+        self.log(f"↩ Move {ax} to 0.000 before + move")
+        return True
 
-    def _ensure_other_axes_ready(self, moving_axes: set[str]) -> bool:
+    def _ensure_other_axes_ready(self, moving_axes: set[str], require_on_positive: set[str]) -> bool:
         if self._homing_active:
             return True
-        if moving_axes == {"X", "Y"}:
-            return self._ensure_axis_home_before_move("X") and self._ensure_axis_home_before_move("Y")
-        if moving_axes == {"X"}:
-            return self._ensure_axis_home_before_move("Y")
-        if moving_axes == {"Y"}:
-            return self._ensure_axis_home_before_move("X")
+        if "X" in require_on_positive and "Y" not in moving_axes:
+            if not self._move_axis_to_zero("Y"):
+                return False
+        if "Y" in require_on_positive and "X" not in moving_axes:
+            if not self._move_axis_to_zero("X"):
+                return False
         return True
 
     def _home_sequence(self, do_x: bool, do_y: bool):
@@ -2034,8 +2039,6 @@ class GRBLInterface:
         ax = axis.upper()
         if not self.is_connected():
             self.log("❌ Not connected")
-            return
-        if not self._ensure_other_axes_ready({ax}):
             return
         # Prefer saved midpoint in WCS if available
         if ax in getattr(self, 'last_mid_wcs', {}):
