@@ -9,7 +9,7 @@
   "default_speed": 400,
   "goto_feed": 1600.0,
   "homing_clearance": 3.0,
-  "homing_feed": 400.0,
+  "homing_feed": 200.0,
   "homing_long_jog": 1600.0,
   "jog_feed": 400.0,
   "jog_step": 10.0

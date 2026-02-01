@@ -20,7 +20,7 @@ except Exception as exc:  # pragma: no cover
         stream=sys.stderr,
     )
     logging.getLogger(__name__).exception("Failed to import StepperPanel", exc_info=exc)
-    raise
+    raise  
 
 try:
     from read_freq.main import FrequencyPanel
