@@ -131,7 +131,13 @@ class MotorController:
         try:  # pragma: no cover - hardware access
             # Jog back to the reported origin and reset the work offset.
             self.jog_increment(axis, -self.get_position(axis), feed=1600.0)
-            self._driver.send_line(f"G10 L20 P0 {axis}0")
+            cmd = f"G10 L20 P0 {axis}0"
+            _, wpos = self.read_status_positions(timeout=0.3)
+            if wpos:
+                for other in AXES:
+                    if other != axis and other in wpos:
+                        cmd += f" {other}{wpos[other]:.3f}"
+            self._driver.send_line(cmd)
         except Exception as exc:
             self._record_error(f"Failed to home axis {axis}: {exc}")
             raise MotorError(str(exc)) from exc
