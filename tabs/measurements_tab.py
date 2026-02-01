@@ -254,6 +254,22 @@ class MeasurementsTab(ttk.Frame):
         self.speed_spin.bind("<FocusOut>", lambda _: self._on_speed_changed())
         self.speed_spin.bind("<Return>", lambda _: self._on_speed_changed())
 
+        ttk.Label(top, text="Start Feed (mm/min):").grid(row=0, column=11, sticky="w")
+        self.start_speed_var = tk.DoubleVar(value=max(1.0, speed_default))
+        self.start_speed_spin = ttk.Spinbox(
+            top,
+            from_=1.0,
+            to=30000.0,
+            increment=10.0,
+            textvariable=self.start_speed_var,
+            width=8,
+            format="%.1f",
+            command=self._on_start_speed_changed,
+        )
+        self.start_speed_spin.grid(row=0, column=12, padx=(4, 0))
+        self.start_speed_spin.bind("<FocusOut>", lambda _: self._on_start_speed_changed())
+        self.start_speed_spin.bind("<Return>", lambda _: self._on_start_speed_changed())
+
         ttk.Label(top, text="Axis:").grid(row=0, column=2, sticky="w")
         self.axis_var = tk.StringVar(value=axis_default)
         self.axis_combo = ttk.Combobox(top, values=axis_choices, textvariable=self.axis_var, state="readonly", width=3)
@@ -471,6 +487,15 @@ class MeasurementsTab(ttk.Frame):
         feed = float(getattr(cfg, "jog_feed", 1600.0) or 1600.0)
         self.speed_var.set(max(1.0, feed))
 
+    def _ensure_status_mask(self) -> None:
+        """Best-effort ensure GRBL status includes MPos/WPos."""
+        if self._motor.is_simulation or not self._motor.is_connected():
+            return
+        try:
+            self._motor.send_line("$10=19")
+        except MotorError:
+            LOGGER.debug("Failed to set $10=19", exc_info=True)
+
     def connect_motor(self) -> None:
         """Connect the shared motor controller using the selected port."""
         port = self.port_var.get()
@@ -492,6 +517,7 @@ class MeasurementsTab(ttk.Frame):
             return
 
         self._logger.info("Motor connected on %s", port)
+        self._ensure_status_mask()
         self._persist_motor_config()
         self._update_connection_buttons()
 
@@ -550,6 +576,14 @@ class MeasurementsTab(ttk.Frame):
             value = float(getattr(self._motor_config, "jog_feed", 1600.0) or 1600.0)
         return max(1.0, value)
 
+    def _sanitize_start_speed_value(self) -> float:
+        """Ensure the start feed value is a positive float (mm/min)."""
+        try:
+            value = float(self.start_speed_var.get())
+        except (tk.TclError, ValueError):
+            value = float(getattr(self._motor_config, "jog_feed", 1600.0) or 1600.0)
+        return max(1.0, value)
+
     def _on_speed_changed(self) -> None:
         """Clamp the feed value and persist it for future sessions."""
         sanitized = self._sanitize_speed_value()
@@ -560,6 +594,16 @@ class MeasurementsTab(ttk.Frame):
         if abs(current - sanitized) > 1e-6:
             self.speed_var.set(sanitized)
         self._persist_motor_config()
+
+    def _on_start_speed_changed(self) -> None:
+        """Clamp the start feed value."""
+        sanitized = self._sanitize_start_speed_value()
+        try:
+            current = float(self.start_speed_var.get())
+        except (tk.TclError, ValueError):
+            current = sanitized
+        if abs(current - sanitized) > 1e-6:
+            self.start_speed_var.set(sanitized)
 
     def _sanitize_int(self, var: tk.IntVar, *, min_value: int, max_value: int, fallback: int) -> int:
         """Read a Tk IntVar safely, clamping to the provided bounds."""
@@ -789,6 +833,7 @@ class MeasurementsTab(ttk.Frame):
         if axis not in AXES:
             axis = AXES[0]
         speed = self._sanitize_speed_value()
+        start_speed = self._sanitize_start_speed_value()
         start_mm = 0.0
         end_mm = 0.0
         accel = 0.0
@@ -841,7 +886,7 @@ class MeasurementsTab(ttk.Frame):
             motor_thread = threading.Thread(
                 target=self._motor_sweep,
                 name=f"MotorSweep-{plot_id}",
-                args=(runtime, axis, start_mm, end_mm, speed, accel, coord_system, mode),
+                args=(runtime, axis, start_mm, end_mm, start_speed, speed, accel, coord_system, mode),
                 daemon=True,
             )
             runtime.motor_thread = motor_thread
@@ -875,7 +920,18 @@ class MeasurementsTab(ttk.Frame):
     def _read_axis_position(self, axis: str, coord_system: str) -> Optional[float]:
         use_machine = coord_system == "machine"
         try:
-            return self._motor.read_status_position(axis, use_machine=use_machine, timeout=STATUS_QUERY_TIMEOUT)
+            mpos, wpos = self._motor.read_status_positions(timeout=STATUS_QUERY_TIMEOUT)
+            if use_machine:
+                if mpos and axis in mpos:
+                    return float(mpos[axis])
+                if wpos and axis in wpos:
+                    return float(wpos[axis])
+                return None
+            if wpos and axis in wpos:
+                return float(wpos[axis])
+            if mpos and axis in mpos:
+                return float(mpos[axis])
+            return None
         except MotorError:
             return None
 
@@ -974,6 +1030,7 @@ class MeasurementsTab(ttk.Frame):
         axis: str,
         start_mm: float,
         end_mm: float,
+        start_speed: float,
         speed: float,
         accel: float,
         coord_system: str,
@@ -986,7 +1043,8 @@ class MeasurementsTab(ttk.Frame):
             stop_event.set()
             return
         try:
-            self._apply_axis_settings(axis, speed=speed, accel=accel)
+            max_speed = max(float(speed), float(start_speed))
+            self._apply_axis_settings(axis, speed=max_speed, accel=accel)
         except MotorError as exc:
             self._report_error(f"Failed to apply axis settings: {exc}")
             stop_event.set()
@@ -994,7 +1052,7 @@ class MeasurementsTab(ttk.Frame):
 
         if self._motor.is_simulation:
             current = runtime.last_coordinate_mm
-            if not self._simulate_axis_move(axis, current, start_mm, speed, stop_event):
+            if not self._simulate_axis_move(axis, current, start_mm, start_speed, stop_event):
                 return
             runtime.last_coordinate_mm = start_mm
             if stop_event.is_set():
@@ -1015,6 +1073,7 @@ class MeasurementsTab(ttk.Frame):
             self._report_error(f"Failed to set motion mode: {exc}")
             stop_event.set()
             return
+        self._ensure_status_mask()
 
         if mode in {"pos_from_zero", "neg_from_zero"}:
             other_axis = "Y" if axis.upper() == "X" else "X"
@@ -1024,13 +1083,13 @@ class MeasurementsTab(ttk.Frame):
             if other_axis:
                 try:
                     if coord_system == "machine":
-                        self._motor.send_line(f"G53 G1 {other_axis}0.000 F{speed:.1f}")
+                        self._motor.send_line(f"G53 G1 {other_axis}0.000 F{start_speed:.1f}")
                     else:
-                        self._motor.send_line(f"G1 {other_axis}0.000 F{speed:.1f}")
+                        self._motor.send_line(f"G1 {other_axis}0.000 F{start_speed:.1f}")
                 except MotorError as exc:
                     if coord_system == "machine":
                         try:
-                            self._motor.send_line(f"G1 {other_axis}0.000 F{speed:.1f}")
+                            self._motor.send_line(f"G1 {other_axis}0.000 F{start_speed:.1f}")
                         except MotorError:
                             self._report_error(f"Failed to move {other_axis} to zero: {exc}")
                             stop_event.set()
@@ -1039,20 +1098,20 @@ class MeasurementsTab(ttk.Frame):
                         self._report_error(f"Failed to move {other_axis} to zero: {exc}")
                         stop_event.set()
                         return
-                if not self._wait_for_target_position(runtime, other_axis, 0.0, coord_system, speed, stop_event):
+                if not self._wait_for_target_position(runtime, other_axis, 0.0, coord_system, start_speed, stop_event):
                     if not stop_event.is_set():
                         self._report_error(f"Timed out waiting for {other_axis} to reach zero.")
                     stop_event.set()
                     return
 
         try:
-            self._motor.send_line(self._build_move_command(axis, start_mm, speed, coord_system))
+            self._motor.send_line(self._build_move_command(axis, start_mm, start_speed, coord_system))
         except MotorError as exc:
             self._report_error(f"Failed to move to start: {exc}")
             stop_event.set()
             return
 
-        if not self._wait_for_target_position(runtime, axis, start_mm, coord_system, speed, stop_event):
+        if not self._wait_for_target_position(runtime, axis, start_mm, coord_system, start_speed, stop_event):
             if not stop_event.is_set():
                 if runtime.stop_reason != "status_missing":
                     self._report_error("Timed out waiting for start position.")
