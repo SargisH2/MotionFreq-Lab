@@ -3,7 +3,7 @@
     "X": true,
     "Y": true
   },
-  "default_axis": "X",
+  "default_axis": "Y",
   "default_baud": 115200,
   "default_port": "COM7",
   "default_speed": 400,

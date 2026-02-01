@@ -841,7 +841,7 @@ class MeasurementsTab(ttk.Frame):
             motor_thread = threading.Thread(
                 target=self._motor_sweep,
                 name=f"MotorSweep-{plot_id}",
-                args=(runtime, axis, start_mm, end_mm, speed, accel, coord_system),
+                args=(runtime, axis, start_mm, end_mm, speed, accel, coord_system, mode),
                 daemon=True,
             )
             runtime.motor_thread = motor_thread
@@ -977,6 +977,7 @@ class MeasurementsTab(ttk.Frame):
         speed: float,
         accel: float,
         coord_system: str,
+        mode: ModeLiteral,
     ) -> None:
         stop_event = runtime.stop_event
         if stop_event is None:
@@ -1014,6 +1015,23 @@ class MeasurementsTab(ttk.Frame):
             self._report_error(f"Failed to set motion mode: {exc}")
             stop_event.set()
             return
+
+        if mode == "pos_from_zero" and end_mm >= start_mm:
+            other_axis = "Y" if axis.upper() == "X" else "X"
+            try:
+                if coord_system == "machine":
+                    self._motor.send_line(f"G53 G1 {other_axis}0.000 F{speed:.1f}")
+                else:
+                    self._motor.send_line(f"G1 {other_axis}0.000 F{speed:.1f}")
+            except MotorError as exc:
+                self._report_error(f"Failed to move {other_axis} to zero: {exc}")
+                stop_event.set()
+                return
+            if not self._wait_for_target_position(runtime, other_axis, 0.0, coord_system, speed, stop_event):
+                if not stop_event.is_set():
+                    self._report_error(f"Timed out waiting for {other_axis} to reach zero.")
+                stop_event.set()
+                return
 
         try:
             self._motor.send_line(self._build_move_command(axis, start_mm, speed, coord_system))
@@ -1105,7 +1123,6 @@ class MeasurementsTab(ttk.Frame):
         if stop_event is None:
             return
         freq_iter: Optional[Iterator[Tuple[float, float]]] = None
-        use_iter = mode == "no_motor_time"
         try:
             interval = max(0.0, self._daq_interval_sec)
             auto_trigger = bool(self._daq_auto_trigger)
@@ -1113,53 +1130,23 @@ class MeasurementsTab(ttk.Frame):
                 if not self._wait_for_sweep_start(runtime, stop_event):
                     return
                 runtime.last_measurement_finished_at = time.perf_counter()
-            def _read_single() -> Optional[Tuple[float, float]]:
-                measurement_interval = interval
-                if self._daq.is_simulation:
-                    measurement_interval = max(measurement_interval, SAMPLING_INTERVAL)
-                ready_at = runtime.last_measurement_finished_at + measurement_interval
-                delay = ready_at - time.perf_counter()
-                if delay > 0:
-                    if stop_event.wait(delay):
-                        return None
-                return self._daq.read_frequencies()
-
-            if use_iter:
-                if self._daq.is_simulation:
-                    freq_iter = self._daq.iter_frequencies(interval=max(SAMPLING_INTERVAL, interval))
-                else:
-                    freq_iter = self._daq.iter_frequencies(
-                        timeout=self._daq.read_timeout,
-                        interval=interval,
-                        auto_trigger=auto_trigger,
-                    )
-                runtime.freq_iter = freq_iter
-                freq_source = freq_iter
-                with closing(freq_source):  # type: ignore[arg-type]
-                    iterator = iter(freq_source)
-                    while not stop_event.is_set():
-                        try:
-                            ch1, ch2 = next(iterator)
-                        except StopIteration:
-                            break
-                        if stop_event.is_set():
-                            break
-                        timestamp = datetime.now()
-                        coordinate = 0.0
-                        elapsed = time.perf_counter() - runtime.start_monotonic
-                        x_value = elapsed
-                        self._record_measurement(runtime, axis, mode, ch1, ch2, coordinate, x_value, elapsed, timestamp)
+            if self._daq.is_simulation:
+                freq_iter = self._daq.iter_frequencies(interval=max(SAMPLING_INTERVAL, interval))
             else:
+                freq_iter = self._daq.iter_frequencies(
+                    timeout=self._daq.read_timeout,
+                    interval=interval,
+                    auto_trigger=auto_trigger,
+                )
+            runtime.freq_iter = freq_iter
+            freq_source = freq_iter
+            with closing(freq_source):  # type: ignore[arg-type]
+                iterator = iter(freq_source)
                 while not stop_event.is_set():
                     try:
-                        sample = _read_single()
-                    except DataAcquisitionError as exc:
-                        self._report_error(f"DAQ read failed: {exc}")
+                        ch1, ch2 = next(iterator)
+                    except StopIteration:
                         break
-                    if sample is None:
-                        break
-                    ch1, ch2 = sample
-                    runtime.last_measurement_finished_at = time.perf_counter()
                     if stop_event.is_set():
                         break
                     timestamp = datetime.now()
