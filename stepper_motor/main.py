@@ -124,10 +124,10 @@ class GRBLInterface:
 
         ttk.Label(top, text="Port:").grid(row=0, column=0, sticky="w")
         initial_ports = self._list_ports()
-        self.port_cmb = ttk.Combobox(top, width=16, state="readonly", values=initial_ports)
+        self.port_var = tk.StringVar(value=cfg.default_port)
+        self.port_cmb = ttk.Combobox(top, width=16, state="readonly", textvariable=self.port_var, values=initial_ports)
         self._apply_default_port_selection(force=True, ports=list(initial_ports))
         self.port_cmb.grid(row=0, column=1, padx=4)
-        self.port_cmb.bind("<<ComboboxSelected>>", lambda _: self._schedule_persist_motor_config())
 
         ttk.Label(top, text="Baud:").grid(row=0, column=2, sticky="w")
         self.baud_entry = ttk.Entry(top, width=8)
@@ -346,8 +346,10 @@ class GRBLInterface:
         self._motor_config = load_motor_config()
         ports = self._list_ports()
         LOGGER.debug("Refreshing port combo with values: %s", ports)
-        self.port_cmb["values"] = ports
-        self._apply_default_port_selection(ports=list(ports))
+        preferred_port = self._motor_config.default_port or self.port_var.get()
+        selected = select_port_value(list(ports), self.port_var.get(), preferred_port)
+        self.port_cmb.configure(values=tuple(ports))
+        self.port_var.set(selected)
 
     def log(self, msg: str):
         # Always enqueue; actual widget updates happen on main thread
@@ -376,7 +378,7 @@ class GRBLInterface:
 
     # -------------------- Serial I/O --------------------
     def connect(self):
-        port = self.port_cmb.get().strip()
+        port = self.port_var.get().strip()
         baud = int(self.baud_entry.get().strip() or "115200")
         backend = self._motor_backend()
         if backend is not None:
@@ -523,7 +525,7 @@ class GRBLInterface:
             return
         available = list(ports if ports is not None else self.port_cmb["values"])
         preferred = (self._motor_config.default_port or "").strip()
-        current = self.port_cmb.get().strip()
+        current = self.port_var.get().strip()
         if not force and current and current in available:
             return
         selected = select_port_value(
@@ -531,7 +533,7 @@ class GRBLInterface:
             current if current in available else "",
             preferred,
         )
-        self.port_cmb.set(selected)
+        self.port_var.set(selected)
 
     def _bind_persist(self, widget: tk.Widget) -> None:
         widget.bind("<Return>", lambda _: self._schedule_persist_motor_config())
@@ -573,7 +575,7 @@ class GRBLInterface:
         cfg.goto_feed = self._read_float_entry(self.goto_feed, cfg.goto_feed)
         cfg.default_baud = self._read_int_entry(self.baud_entry, cfg.default_baud)
         try:
-            cfg.default_port = self.port_cmb.get().strip()
+            cfg.default_port = self.port_var.get().strip()
         except Exception:
             pass
         return cfg
