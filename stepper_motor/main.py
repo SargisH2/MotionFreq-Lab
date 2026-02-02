@@ -1614,7 +1614,6 @@ class GRBLInterface:
     
         self.log(f"→ Moving {label}: {axis} {'+' if dir_sign>0 else '-'} in {chunk}mm steps until ALARM")
         self.alarm_event.clear()
-        self.stop_event.clear()
         if self._pending_hard_limits_enable:
             if self._suspend_hard_limits_enforcement:
                 raise RuntimeError("Hard limits are temporarily disabled; cannot seek an ALARM.")
@@ -1848,6 +1847,7 @@ class GRBLInterface:
         threading.Thread(target=self._home_sequence, args=(True, True), daemon=True).start()
 
     def request_stop(self):
+        self.stop_event.set()
         backend = self._motor_backend()
         if backend is not None:
             try:
@@ -1874,11 +1874,15 @@ class GRBLInterface:
                 self.log(f"⚠ Reconnect after stop failed: {exc}")
 
     def _recover_after_alarm(self, note: str):
+        if self.stop_event.is_set():
+            raise RuntimeError("Stopped by user")
         self.log(f"↺ Recover after ALARM: {note}")
         # Simplify recovery per user workflow: full reconnect then $X
         self.safe_send_raw(b"\x85")
         time.sleep(0.05)
         self.reconnect()
+        if self.stop_event.is_set():
+            raise RuntimeError("Stopped by user")
         if not self.unlock_and_prepare(retries=5):
             self.log("ℹ Could not unlock with $X after reconnect. Ensure limit switch is released.")
             raise RuntimeError("Unlock failed after reconnect")
@@ -2004,6 +2008,8 @@ class GRBLInterface:
 
             if do_x and self.x_en.get():
                 homed_ok &= self._home_one_axis_release("X", long_mm, feed, clear_mm)
+                if self.stop_event.is_set():
+                    homed_ok = False
                 if homed_ok and do_y and self.y_en.get():
                     # Return X to its captured home before starting Y if it drifted.
                     try:
@@ -2023,6 +2029,8 @@ class GRBLInterface:
 
             if do_y and self.y_en.get():
                 homed_ok &= self._home_one_axis_release("Y", long_mm, feed, clear_mm)
+                if self.stop_event.is_set():
+                    homed_ok = False
 
             if homed_ok and self.is_connected():
                 self.safe_send("G90")
@@ -2152,10 +2160,16 @@ class GRBLInterface:
         minus_release = None
 
         try:
+            if self.stop_event.is_set():
+                raise RuntimeError("Stopped by user")
             # 1) Seek +limit until ALARM
             self.move_until_alarm(ax, +1, long_mm, feed, label="+limit")
+            if self.stop_event.is_set():
+                raise RuntimeError("Stopped by user")
             # Recover and jog off until switch releases; capture plus_release
             self._recover_after_alarm("+limit")
+            if self.stop_event.is_set():
+                raise RuntimeError("Stopped by user")
             if not self.clear_limit_with_retries(ax, away_dir=-1, feed_clear=gentle, step_mm=0.25, max_attempts=40):
                 self.log(f"⚠ Could not clear {ax}+ switch reliably.")
             m = self.get_mpos()
@@ -2170,8 +2184,12 @@ class GRBLInterface:
 
             # 2) Seek -limit until ALARM using small steps for accuracy
             self.move_until_alarm(ax, -1, long_mm, gentle, label="-limit", step_mm=3.0)
+            if self.stop_event.is_set():
+                raise RuntimeError("Stopped by user")
             # Recover and jog off until switch releases; capture minus_release
             self._recover_after_alarm("-limit")
+            if self.stop_event.is_set():
+                raise RuntimeError("Stopped by user")
             if not self.clear_limit_with_retries(ax, away_dir=+1, feed_clear=gentle, step_mm=0.25, max_attempts=40):
                 self.log(f"⚠ Could not clear {ax}- switch reliably.")
             m = self.get_mpos()
