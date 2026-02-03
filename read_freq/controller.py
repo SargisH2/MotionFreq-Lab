@@ -211,7 +211,10 @@ class VWFrequencyController:
         data = bytes((self.k_value,))
         self._serial.write(data)
         self._log_bytes('>', data)
-        self._serial.flush()
+        try:
+            self._serial.flush()
+        except Exception:
+            raise ControllerError("Failed to flush serial output buffer.")
 
     # ------------------------------------------------------------------
     def iter_frames(

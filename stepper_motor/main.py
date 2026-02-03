@@ -302,6 +302,7 @@ class GRBLInterface:
         
         # Log
         self.log_area = scrolledtext.ScrolledText(master, width=80, height=18, state="disabled")
+        self.log_area.bind("<MouseWheel>", "break")
         self.log_area.grid(row=4, column=0, padx=8, pady=8, sticky="nsew")
         master.rowconfigure(4, weight=1)
         master.columnconfigure(0, weight=1)
